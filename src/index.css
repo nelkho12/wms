@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@layer base {
+  /* Sharp Anchor Design System - Clean rectangular sharp edges for all UI elements, boxes, buttons, cards, modals, and inputs */
+  :root {
+    --radius: 0px;
+  }
+
+  div, 
+  button, 
+  input, 
+  select, 
+  textarea, 
+  form, 
+  section, 
+  article, 
+  nav, 
+  header, 
+  main, 
+  footer, 
+  table, 
+  aside,
+  dialog,
+  ul,
+  li {
+    border-radius: 0px !important;
+  }
+
+  /* Exclude circular status indicator dots and avatar circles if necessary */
+  .rounded-full.w-1,
+  .rounded-full.w-1\.5,
+  .rounded-full.w-2,
+  .rounded-full.w-2\.5,
+  .rounded-full.w-3,
+  .rounded-full.w-8,
+  .rounded-full.w-9,
+  .rounded-full.w-10,
+  .status-dot {
+    border-radius: 9999px !important;
+  }
+}

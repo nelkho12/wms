@@ -1,0 +1,6 @@
+{
+  "name": "ApexWMS - Intelligent Warehouse Management System",
+  "description": "Enterprise WMS with real-time inventory tracking, FEFO batch & best-before date traceability, automated picking route optimization, mobile floor scanner mode, and MS SQL database backend.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
