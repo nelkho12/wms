@@ -1,8 +1,13 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
+
 !.env.example
+# build output & secrets
+*.log
+.DS_Store
+.env
+.env*
+build/
+coverage/
+dist-service/
+dist/
+node_modules/
+release/

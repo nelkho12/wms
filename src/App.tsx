@@ -12,19 +12,10 @@ import { RoleManagementModal } from './components/RoleManagementModal';
 import { UserProfileModal } from './components/UserProfileModal';
 import { LoginModal } from './components/LoginModal';
 import { DataBackupModal } from './components/DataBackupModal';
-import { fetchInventory, fetchOrders, fetchAuditLogs, createAuditLogEntry, fetchUsers, createUser, updateUserProfile, deleteUser } from './services/api';
-import {
-  INITIAL_SKUS,
-  INITIAL_LOCATIONS,
-  INITIAL_BATCHES,
-  INITIAL_ORDERS,
-  INITIAL_STOCK_MOVEMENTS,
-  INITIAL_AUDIT_LOGS,
-  INITIAL_FACILITIES,
-  INITIAL_ZONES
-} from './data/initialData';
+import { fetchInventory, fetchOrders, fetchAuditLogs, createAuditLogEntry, fetchUsers, createUser, updateUserProfile, deleteUser, fetchMe, saveRolePermissions, RolePermissionMap } from './services/api';
+import { AUTH_EXPIRED_EVENT, getToken, setToken } from './services/http';
 import { ProductSKU, Location, Batch, PickOrder, StockMovement, AuditLogEntry, AuditCategory, WarehouseFacility, StorageZone } from './types/wms';
-import { INITIAL_USERS, UserProfile, UserRole, WmsPermission, ROLE_DEFINITIONS } from './types/roles';
+import { UserProfile, UserRole, WmsPermission, ROLE_DEFINITIONS } from './types/roles';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'inventory' | 'salesOrders' | 'reports' | 'traceability' | 'route' | 'mssql' | 'mobile'>('inventory');
@@ -33,62 +24,53 @@ export default function App() {
   const [showRoleModal, setShowRoleModal] = useState(false);
   const [showBackupModal, setShowBackupModal] = useState(false);
 
-  // User Auth & RBAC Roles State
-  const [usersList, setUsersList] = useState<UserProfile[]>(INITIAL_USERS);
-  const [currentUser, setCurrentUser] = useState<UserProfile>(INITIAL_USERS[0]); // Default Admin
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(true);
+  // Who is signed in. Nothing is shown until the server has accepted a login.
+  const SIGNED_OUT_USER: UserProfile = { id: '', name: '', email: '', role: 'Picker', department: '', shift: '', badgeCode: '' };
+  const [usersList, setUsersList] = useState<UserProfile[]>([]);
+  const [currentUser, setCurrentUser] = useState<UserProfile>(SIGNED_OUT_USER);
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [authChecked, setAuthChecked] = useState<boolean>(false);
+  const [loginNotice, setLoginNotice] = useState<string>('');
+  const [loginPrefill, setLoginPrefill] = useState<string>('');
+  const [serverDown, setServerDown] = useState<boolean>(false);
   const [showUserProfileModal, setShowUserProfileModal] = useState<boolean>(false);
-  const [showLoginModal, setShowLoginModal] = useState<boolean>(false);
 
-  // Custom RBAC Role Permissions Matrix state (Admin editable)
-  const [customRolePermissions, setCustomRolePermissions] = useState<Record<UserRole, WmsPermission[]>>(() => {
-    const saved = localStorage.getItem('apex_custom_role_permissions');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.warn('Failed to parse saved custom role permissions', e);
-      }
-    }
-    return {
-      Admin: [...ROLE_DEFINITIONS.Admin.permissions],
-      'Warehouse Manager': [...ROLE_DEFINITIONS['Warehouse Manager'].permissions],
-      Picker: [...ROLE_DEFINITIONS.Picker.permissions],
-      Receiver: [...ROLE_DEFINITIONS.Receiver.permissions]
-    };
+  // Role permission matrix: stored on the server so every computer follows the same rules.
+  const defaultPermissionMap = (): Record<UserRole, WmsPermission[]> => ({
+    Admin: [...ROLE_DEFINITIONS.Admin.permissions],
+    'Warehouse Manager': [...ROLE_DEFINITIONS['Warehouse Manager'].permissions],
+    Picker: [...ROLE_DEFINITIONS.Picker.permissions],
+    Receiver: [...ROLE_DEFINITIONS.Receiver.permissions]
   });
+  const [customRolePermissions, setCustomRolePermissions] = useState<Record<UserRole, WmsPermission[]>>(defaultPermissionMap);
+
+  const pushRolePermissions = async (next: RolePermissionMap) => {
+    setCustomRolePermissions(next);
+    try {
+      setCustomRolePermissions(await saveRolePermissions(next));
+    } catch (err: any) {
+      alert(`Could not save role permissions: ${err.message}`);
+      const me = await fetchMe();
+      if (me) setCustomRolePermissions({ ...defaultPermissionMap(), ...me.rolePermissions });
+    }
+  };
 
   const handleToggleRolePermission = (role: UserRole, permission: WmsPermission) => {
-    setCustomRolePermissions((prev) => {
-      const currentList = prev[role] || [];
-      const has = currentList.includes(permission);
-      const nextList = has
-        ? currentList.filter((p) => p !== permission)
-        : [...currentList, permission];
-      const updated = { ...prev, [role]: nextList };
-      localStorage.setItem('apex_custom_role_permissions', JSON.stringify(updated));
-      
-      logAuditActivity(
-        'ROLE_MANAGEMENT',
-        has ? 'REVOKE_PERMISSION' : 'GRANT_PERMISSION',
-        role,
-        `Admin ${currentUser.name} ${has ? 'REVOKED' : 'GRANTED'} capability '${permission}' for role '${role}'.`,
-        'WARNING'
-      );
-      
-      return updated;
-    });
+    const currentList = customRolePermissions[role] || [];
+    const has = currentList.includes(permission);
+    const nextList = has ? currentList.filter((p) => p !== permission) : [...currentList, permission];
+    pushRolePermissions({ ...customRolePermissions, [role]: nextList });
+    logAuditActivity(
+      'ROLE_MANAGEMENT',
+      has ? 'REVOKE_PERMISSION' : 'GRANT_PERMISSION',
+      role,
+      `Admin ${currentUser.name} ${has ? 'REVOKED' : 'GRANTED'} capability '${permission}' for role '${role}'.`,
+      'WARNING'
+    );
   };
 
   const handleResetRolePermissions = () => {
-    const defaultPerms: Record<UserRole, WmsPermission[]> = {
-      Admin: [...ROLE_DEFINITIONS.Admin.permissions],
-      'Warehouse Manager': [...ROLE_DEFINITIONS['Warehouse Manager'].permissions],
-      Picker: [...ROLE_DEFINITIONS.Picker.permissions],
-      Receiver: [...ROLE_DEFINITIONS.Receiver.permissions]
-    };
-    setCustomRolePermissions(defaultPerms);
-    localStorage.setItem('apex_custom_role_permissions', JSON.stringify(defaultPerms));
+    pushRolePermissions(defaultPermissionMap());
     logAuditActivity(
       'ROLE_MANAGEMENT',
       'RESET_PERMISSIONS_MATRIX',
@@ -99,14 +81,14 @@ export default function App() {
   };
 
   // WMS State
-  const [skus, setSkus] = useState<ProductSKU[]>(INITIAL_SKUS);
-  const [locations, setLocations] = useState<Location[]>(INITIAL_LOCATIONS);
-  const [batches, setBatches] = useState<any[]>(INITIAL_BATCHES);
-  const [orders, setOrders] = useState<PickOrder[]>(INITIAL_ORDERS);
-  const [stockMovements, setStockMovements] = useState<StockMovement[]>(INITIAL_STOCK_MOVEMENTS);
-  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(INITIAL_AUDIT_LOGS);
-  const [facilities, setFacilities] = useState<WarehouseFacility[]>(INITIAL_FACILITIES);
-  const [zones, setZones] = useState<StorageZone[]>(INITIAL_ZONES);
+  const [skus, setSkus] = useState<ProductSKU[]>([]);
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [batches, setBatches] = useState<any[]>([]);
+  const [orders, setOrders] = useState<PickOrder[]>([]);
+  const [stockMovements, setStockMovements] = useState<StockMovement[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
+  const [facilities, setFacilities] = useState<WarehouseFacility[]>([]);
+  const [zones, setZones] = useState<StorageZone[]>([]);
   const [deletedCategories, setDeletedCategories] = useState<string[]>([]);
 
   // Optional Feature Toggles (Admin Ticketed Functions)
@@ -147,17 +129,18 @@ export default function App() {
   const loadData = async () => {
     try {
       const invData = await fetchInventory();
-      if (invData) {
-        setSkus(invData.skus || INITIAL_SKUS);
-        setLocations(invData.locations || INITIAL_LOCATIONS);
-        setBatches(invData.batches || INITIAL_BATCHES);
-        setStockMovements(invData.stockMovements || INITIAL_STOCK_MOVEMENTS);
-        if (invData.facilities) setFacilities(invData.facilities);
-        if (invData.zones) setZones(invData.zones);
-        if (invData.deletedCategories) {
-          setDeletedCategories(invData.deletedCategories);
-        }
+      if (!invData) {
+        setServerDown(true);
+        return;
       }
+      setServerDown(false);
+      setSkus(invData.skus || []);
+      setLocations(invData.locations || []);
+      setBatches(invData.batches || []);
+      setStockMovements(invData.stockMovements || []);
+      setFacilities(invData.facilities || []);
+      setZones(invData.zones || []);
+      setDeletedCategories(invData.deletedCategories || []);
 
       const orderData = await fetchOrders();
       if (orderData) {
@@ -165,26 +148,71 @@ export default function App() {
       }
 
       const logsData = await fetchAuditLogs();
-      if (logsData && logsData.length > 0) {
+      if (logsData) {
         setAuditLogs(logsData);
       }
 
       const userData = await fetchUsers();
       if (userData && userData.length > 0) {
         setUsersList(userData);
-        setCurrentUser((prev) => {
-          const matched = userData.find((u) => u.id === prev.id);
-          return matched || userData[0];
-        });
+        // Keep my own profile up to date (never switch to somebody else's).
+        setCurrentUser((prev) => userData.find((u) => u.id === prev.id) || prev);
       }
     } catch (err) {
-      console.warn('Backend loading warning, using local initial state:', err);
+      console.warn('Could not load data from the service:', err);
+      setServerDown(true);
     }
   };
 
+  const clearLocalData = () => {
+    setSkus([]);
+    setLocations([]);
+    setBatches([]);
+    setOrders([]);
+    setStockMovements([]);
+    setAuditLogs([]);
+    setFacilities([]);
+    setZones([]);
+    setUsersList([]);
+  };
+
+  // On start: if a saved login is still valid, go straight in.
   useEffect(() => {
-    loadData();
+    (async () => {
+      if (getToken()) {
+        const me = await fetchMe();
+        if (me) {
+          setCurrentUser(me.user);
+          setCustomRolePermissions({ ...defaultPermissionMap(), ...me.rolePermissions });
+          setIsLoggedIn(true);
+        } else {
+          setToken('');
+        }
+      }
+      setAuthChecked(true);
+    })();
   }, []);
+
+  // The server said "please sign in again" (session ended, or the account was removed).
+  useEffect(() => {
+    const onExpired = () => {
+      clearLocalData();
+      setIsLoggedIn(false);
+      setLoginNotice('Your session has ended. Please sign in again.');
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired);
+  }, []);
+
+  // Load data after signing in, and refresh regularly so changes made on other computers appear.
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    loadData();
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') loadData();
+    }, 20000);
+    return () => clearInterval(timer);
+  }, [isLoggedIn]);
 
   const logAuditActivity = (
     actionCategory: AuditCategory,
@@ -193,9 +221,10 @@ export default function App() {
     details: string,
     severity: 'INFO' | 'WARNING' | 'CRITICAL' = 'INFO'
   ) => {
+    // The server records the real signed-in user and time; this is only a quick local echo.
     const newEntry: AuditLogEntry = {
-      id: `AUD-${Date.now().toString().slice(-6)}`,
-      timestamp: new Date().toISOString().replace('T', ' ').slice(0, 19),
+      id: `AUD-LOCAL-${Date.now()}`,
+      timestamp: new Date().toLocaleString('sv-SE'),
       userId: currentUser.id,
       userName: currentUser.name,
       userRole: currentUser.role,
@@ -203,8 +232,7 @@ export default function App() {
       actionType,
       targetEntity,
       details,
-      severity,
-      ipAddress: '192.168.1.10'
+      severity
     };
 
     setAuditLogs((prev) => [newEntry, ...prev]);
@@ -221,28 +249,19 @@ export default function App() {
     });
   };
 
+  // "Switch user" now means: sign out and sign in as that person (with their password).
   const handleSwitchUser = (newUser: UserProfile) => {
-    logAuditActivity(
-      'ROLE_MANAGEMENT',
-      'USER_PROFILE_SWITCH',
-      `User ${newUser.name}`,
-      `Switched active session user profile to ${newUser.name} (${newUser.role}).`,
-      'INFO'
-    );
-    setCurrentUser(newUser);
-    setIsLoggedIn(true);
+    if (newUser.id === currentUser.id) return;
+    if (!window.confirm(`Sign out and sign in as ${newUser.name}? You will need their password.`)) return;
+    setLoginPrefill(newUser.email);
+    handleLogout();
   };
 
-  const handleLogin = (user: UserProfile) => {
+  const handleLogin = (user: UserProfile, rolePermissions: RolePermissionMap) => {
     setCurrentUser(user);
+    setCustomRolePermissions({ ...defaultPermissionMap(), ...rolePermissions });
+    setLoginNotice('');
     setIsLoggedIn(true);
-    logAuditActivity(
-      'SYSTEM',
-      'USER_LOGIN',
-      `User ${user.name}`,
-      `Authenticated user login session for ${user.name} (${user.role}).`,
-      'INFO'
-    );
   };
 
   const handleLogout = () => {
@@ -253,9 +272,15 @@ export default function App() {
       `User ${currentUser.name} signed out of active session.`,
       'INFO'
     );
-    setIsLoggedIn(false);
-    setShowUserProfileModal(false);
-    setShowLoginModal(true);
+    // give the log entry a moment to reach the server before the token is dropped
+    setTimeout(() => {
+      setToken('');
+      clearLocalData();
+      setCurrentUser(SIGNED_OUT_USER);
+      setIsLoggedIn(false);
+      setShowUserProfileModal(false);
+      setShowRoleModal(false);
+    }, 150);
   };
 
   const handleUpdateUserRole = async (userId: string, newRole: UserRole) => {
@@ -275,14 +300,8 @@ export default function App() {
         `Updated role for ${updated.name} from ${oldRole} to ${newRole}.`,
         'WARNING'
       );
-    } catch (err) {
-      // Local fallback
-      setUsersList((prev) =>
-        prev.map((u) => (u.id === userId ? { ...u, role: newRole } : u))
-      );
-      if (currentUser.id === userId) {
-        setCurrentUser((prev) => ({ ...prev, role: newRole }));
-      }
+    } catch (err: any) {
+      alert(`Could not change the role: ${err.message}`);
     }
   };
 
@@ -293,71 +312,40 @@ export default function App() {
     department?: string;
     shift?: string;
     badgeCode?: string;
+    password: string;
   }) => {
-    try {
-      const created = await createUser(userData);
-      setUsersList((prev) => [...prev, created]);
-      logAuditActivity(
-        'ROLE_MANAGEMENT',
-        'USER_CREATED',
-        `User ${created.name}`,
-        `Created team member profile for ${created.name} (${created.role}, ${created.email}).`,
-        'INFO'
-      );
-      return created;
-    } catch (err: any) {
-      // Local fallback
-      const fallbackUser: UserProfile = {
-        id: `USR-${Math.floor(100 + Math.random() * 900)}`,
-        name: userData.name,
-        email: userData.email,
-        role: userData.role,
-        department: userData.department || 'Warehouse Operations',
-        shift: userData.shift || 'First Shift (07:00 - 15:30)',
-        badgeCode: userData.badgeCode || `BDG-${Math.floor(1000 + Math.random() * 9000)}`
-      };
-      setUsersList((prev) => [...prev, fallbackUser]);
-      return fallbackUser;
-    }
+    const created = await createUser(userData); // errors are shown by the form
+    setUsersList((prev) => [...prev, created]);
+    logAuditActivity(
+      'ROLE_MANAGEMENT',
+      'USER_CREATED',
+      `User ${created.name}`,
+      `Created team member profile for ${created.name} (${created.role}, ${created.email}).`,
+      'INFO'
+    );
+    return created;
   };
 
-  const handleEditUserProfile = async (id: string, updates: Partial<UserProfile>) => {
-    try {
-      const updated = await updateUserProfile(id, updates);
-      setUsersList((prev) => prev.map((u) => (u.id === id ? updated : u)));
-      if (currentUser.id === id) {
-        setCurrentUser(updated);
-      }
-      logAuditActivity(
-        'ROLE_MANAGEMENT',
-        'USER_PROFILE_UPDATED',
-        `User ${updated.name}`,
-        `Updated team member profile for ${updated.name} (${updated.role}).`,
-        'INFO'
-      );
-      return updated;
-    } catch (err) {
-      setUsersList((prev) =>
-        prev.map((u) => (u.id === id ? { ...u, ...updates } : u))
-      );
-      if (currentUser.id === id) {
-        setCurrentUser((prev) => ({ ...prev, ...updates }));
-      }
+  const handleEditUserProfile = async (id: string, updates: Partial<UserProfile> & { password?: string }) => {
+    const updated = await updateUserProfile(id, updates); // errors are shown by the form
+    setUsersList((prev) => prev.map((u) => (u.id === id ? updated : u)));
+    if (currentUser.id === id) {
+      setCurrentUser(updated);
     }
+    logAuditActivity(
+      'ROLE_MANAGEMENT',
+      'USER_PROFILE_UPDATED',
+      `User ${updated.name}`,
+      `Updated team member profile for ${updated.name} (${updated.role}).`,
+      'INFO'
+    );
+    return updated;
   };
 
   const handleDeleteUser = async (id: string) => {
     const target = usersList.find((u) => u.id === id);
-    try {
-      await deleteUser(id);
-    } catch (err) {
-      console.warn('Backend delete failed, performing local delete:', err);
-    }
-    const remaining = usersList.filter((u) => u.id !== id);
-    setUsersList(remaining);
-    if (currentUser.id === id && remaining.length > 0) {
-      setCurrentUser(remaining[0]);
-    }
+    await deleteUser(id); // errors are shown by the form
+    setUsersList((prev) => prev.filter((u) => u.id !== id));
     logAuditActivity(
       'ROLE_MANAGEMENT',
       'USER_DELETED',
@@ -370,8 +358,21 @@ export default function App() {
   const criticalExpiryCount = batches.filter((b) => b.expiryAlert === 'CRITICAL').length;
   const quarantinedCount = batches.filter((b) => b.status === 'QUARANTINED').length;
 
+  if (!authChecked) {
+    return <div className="min-h-screen bg-slate-950 flex items-center justify-center text-slate-300 text-sm">Starting ApexWMS...</div>;
+  }
+
+  if (!isLoggedIn) {
+    return <LoginModal isOpen={true} onLogin={handleLogin} prefillEmail={loginPrefill} notice={loginNotice} />;
+  }
+
   return (
     <div className="min-h-screen bg-slate-50/80 text-slate-900 flex flex-col font-sans antialiased selection:bg-indigo-600 selection:text-white">
+      {serverDown && (
+        <div className="bg-rose-600 text-white text-xs font-bold text-center py-2 px-4">
+          Cannot reach the ApexWMS service. What you see may be out of date, and changes will not be saved until the connection is back.
+        </div>
+      )}
       
       {/* Top Header Navigation */}
       <Navbar
@@ -382,7 +383,7 @@ export default function App() {
         onOpenAiInsights={() => setShowAiModal(true)}
         onOpenRoleModal={() => setShowRoleModal(true)}
         onOpenUserProfileModal={() => setShowUserProfileModal(true)}
-        onOpenLoginModal={() => setShowLoginModal(true)}
+        onOpenLoginModal={handleLogout}
         onOpenBackupModal={() => setShowBackupModal(true)}
         onLogout={handleLogout}
         isLoggedIn={isLoggedIn}
@@ -536,15 +537,6 @@ export default function App() {
         onOpenSwitchUserModal={() => setShowRoleModal(true)}
         auditLogs={auditLogs}
         customRolePermissions={customRolePermissions}
-      />
-
-      {/* Login Modal Overlay */}
-      <LoginModal
-        isOpen={showLoginModal}
-        onClose={() => setShowLoginModal(false)}
-        usersList={usersList}
-        onLogin={handleLogin}
-        currentUser={currentUser}
       />
 
       {/* System Data Backup & Cloud Snapshot Modal */}

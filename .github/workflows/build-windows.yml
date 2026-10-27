@@ -1,0 +1,38 @@
+name: Build Windows installer
+
+# Builds ApexWMS-Setup-x.y.z.exe (the desktop app) and the service bundle on a Windows machine.
+# Run it from the GitHub "Actions" tab (Run workflow), or it runs on every push to the main branch.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run lint
+      - run: npm test
+      - run: npm run desktop:dist
+      - run: npm run build:service
+      - name: Collect service files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release/service | Out-Null
+          Copy-Item dist-service/server.cjs release/service/
+          Copy-Item .env.example release/service/
+          Copy-Item deploy/windows/* release/service/
+          Copy-Item deploy/sql/* release/service/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ApexWMS-desktop-installer
+          path: release/*.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ApexWMS-service-for-SQL-PC
+          path: release/service

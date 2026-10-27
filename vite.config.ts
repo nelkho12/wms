@@ -5,6 +5,8 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    // Relative paths so the built app also works when opened from a file (desktop app).
+    base: './',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {

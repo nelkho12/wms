@@ -47,8 +47,9 @@ interface RoleManagementModalProps {
     department?: string;
     shift?: string;
     badgeCode?: string;
+    password: string;
   }) => Promise<UserProfile | void>;
-  onEditUserProfile?: (id: string, updates: Partial<UserProfile>) => Promise<UserProfile | void>;
+  onEditUserProfile?: (id: string, updates: Partial<UserProfile> & { password?: string }) => Promise<UserProfile | void>;
   onDeleteUser?: (id: string) => Promise<void>;
   enableSafetyReorder?: boolean;
   onToggleSafetyReorder?: (enabled: boolean) => void;
@@ -100,6 +101,7 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
   const [createDept, setCreateDept] = useState('Warehouse Floor Operations');
   const [createShift, setCreateShift] = useState('First Shift (07:00 - 15:30)');
   const [createBadge, setCreateBadge] = useState('');
+  const [createPassword, setCreatePassword] = useState('');
   const [isSubmittingCreate, setIsSubmittingCreate] = useState(false);
 
   // Edit User state
@@ -110,6 +112,7 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
   const [editDept, setEditDept] = useState('');
   const [editShift, setEditShift] = useState('');
   const [editBadge, setEditBadge] = useState('');
+  const [editPassword, setEditPassword] = useState('');
   const [isSubmittingEdit, setIsSubmittingEdit] = useState(false);
 
   // Delete User Confirmation state
@@ -132,12 +135,17 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
     setCreateDept('Warehouse Floor Operations');
     setCreateShift('First Shift (07:00 - 15:30)');
     setCreateBadge(`BDG-${Math.floor(1000 + Math.random() * 9000)}`);
+    setCreatePassword('');
     setShowCreateModal(true);
   };
 
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!createName.trim() || !createEmail.trim()) return;
+    if (createPassword.length < 8) {
+      alert('Please enter a starting password of at least 8 characters.');
+      return;
+    }
 
     setIsSubmittingCreate(true);
     try {
@@ -148,7 +156,8 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
           role: createRole,
           department: createDept,
           shift: createShift,
-          badgeCode: createBadge
+          badgeCode: createBadge,
+          password: createPassword
         });
       }
       showToast(`✅ Created team member profile for '${createName}'`);
@@ -168,6 +177,7 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
     setEditDept(user.department || '');
     setEditShift(user.shift || '');
     setEditBadge(user.badgeCode || '');
+    setEditPassword('');
   };
 
   const handleEditSubmit = async (e: React.FormEvent) => {
@@ -183,7 +193,8 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
           role: editRole,
           department: editDept,
           shift: editShift,
-          badgeCode: editBadge
+          badgeCode: editBadge,
+          ...(editPassword ? { password: editPassword } : {})
         });
       }
       showToast(`✅ Updated team member profile for '${editName}'`);
@@ -806,6 +817,18 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
               </div>
 
               <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">Starting Password (min. 8 characters)</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={createPassword}
+                  onChange={(e) => setCreatePassword(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl p-2.5 text-xs text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-purple-600"
+                />
+                <p className="text-[10px] text-slate-500 mt-1">The person can change it later from their profile.</p>
+              </div>
+
+              <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">Department</label>
                 <input
                   type="text"
@@ -920,6 +943,17 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
                     className="w-full bg-slate-50 border border-slate-300 rounded-xl p-2.5 text-xs text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-blue-600"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">Reset Password (leave empty to keep the current one)</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={editPassword}
+                  onChange={(e) => setEditPassword(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl p-2.5 text-xs text-slate-900 font-mono focus:bg-white focus:outline-none focus:border-blue-600"
+                />
               </div>
 
               <div>
