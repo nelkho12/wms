@@ -840,6 +840,26 @@ export async function changeMyPassword(currentPassword: string, newPassword: str
   if (!res.ok) throw new Error(await errorText(res, 'Could not change the password.'));
 }
 
+export interface WarehouseSettings {
+  allowNegativeStock: boolean;
+}
+
+export async function fetchSettings(): Promise<WarehouseSettings> {
+  const res = await apiFetch('/api/settings');
+  if (!res.ok) throw new Error(await errorText(res, 'Could not load settings.'));
+  return res.json();
+}
+
+export async function saveSettings(settings: WarehouseSettings): Promise<WarehouseSettings> {
+  const res = await apiFetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  });
+  if (!res.ok) throw new Error(await errorText(res, 'Could not save settings.'));
+  return res.json();
+}
+
 export async function saveRolePermissions(map: RolePermissionMap): Promise<RolePermissionMap> {
   const res = await apiFetch('/api/role-permissions', {
     method: 'PUT',

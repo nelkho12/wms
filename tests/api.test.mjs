@@ -275,6 +275,63 @@ test('route optimizer uses on-hand stock, only the remaining quantity, and repor
   assert.ok(r.body.route.savedDistancePercent >= 0);
 });
 
+// ------------------------------------------------------------------ negative stock (Admin tick)
+test('NEG allow-negative-stock is off by default and only an Admin can change it', async () => {
+  assert.equal((await api('GET', '/api/settings')).body.allowNegativeStock, false);
+  const made = await api('POST', '/api/users', { name: 'Nina Picker', email: 'nina@test.local', role: 'Picker', password: 'Picker12345' });
+  assert.equal(made.status, 200, JSON.stringify(made.body));
+  const pt = (await api('POST', '/api/auth/login', { email: 'nina@test.local', password: 'Picker12345' }, '')).body.token;
+  assert.equal((await api('GET', '/api/settings', undefined, pt)).status, 200); // anyone signed in may read it
+  assert.equal((await api('PUT', '/api/settings', { allowNegativeStock: true }, pt)).status, 403);
+  assert.equal((await api('PUT', '/api/settings', { allowNegativeStock: 'yes' })).status, 400);
+  assert.equal((await api('GET', '/api/settings')).body.allowNegativeStock, false);
+});
+test('NEG when ticked, stock-outs may take a batch below zero; when unticked they are refused again', async () => {
+  const b = await activeBatch();
+  const start = b.quantityOnHand;
+  // off: refused
+  assert.equal((await api('POST', '/api/inventory/outbound', { sku, batchNo: b.batchNo, quantity: start + 5 })).status, 400);
+  assert.equal((await api('POST', '/api/inventory/adjust', { sku, batchNo: b.batchNo, adjustmentType: 'SUBTRACT', countedQuantity: start + 5 })).status, 400);
+
+  const on = await api('PUT', '/api/settings', { allowNegativeStock: true });
+  assert.equal(on.status, 200);
+  assert.equal(on.body.allowNegativeStock, true);
+  assert.ok((await api('GET', '/api/audit-logs')).body.some((a) => a.actionType === 'NEGATIVE_STOCK_SETTING' && a.severity === 'WARNING'));
+
+  // outbound from one batch
+  const out = await api('POST', '/api/inventory/outbound', { sku, batchNo: b.batchNo, quantity: start + 5 });
+  assert.equal(out.status, 200, JSON.stringify(out.body));
+  assert.equal((await batchOf(b.batchNo, sku)).quantityOnHand, -5);
+  assert.ok(out.body.warnings.some((w) => /NEGATIVE/.test(w)));
+  // subtract adjustment
+  const adj = await api('POST', '/api/inventory/adjust', { sku, batchNo: b.batchNo, adjustmentType: 'SUBTRACT', countedQuantity: 3 });
+  assert.equal(adj.status, 200, JSON.stringify(adj.body));
+  assert.equal((await batchOf(b.batchNo, sku)).quantityOnHand, -8);
+  // picking more than is on hand
+  const o = await newOrder(2);
+  const pick = await api('POST', '/api/orders/complete-pick', { orderId: o.id, pickedItems: [{ batchNo: b.batchNo, sku, qty: 2 }] });
+  assert.equal(pick.status, 200, JSON.stringify(pick.body));
+  assert.equal((await batchOf(b.batchNo, sku)).quantityOnHand, -10);
+  // FEFO outbound for more than the SKU holds
+  const sumOnHand = async () => (await inv()).batches.filter((x) => x.sku === sku).reduce((n, x) => n + x.quantityOnHand, 0);
+  const positive = (await inv()).batches.filter((x) => x.sku === sku && x.status === 'ACTIVE' && x.quantityOnHand > 0).reduce((n, x) => n + x.quantityOnHand, 0);
+  const sumBefore = await sumOnHand();
+  const fefo = await api('POST', '/api/inventory/outbound', { sku, quantity: positive + 7 });
+  assert.equal(fefo.status, 200, JSON.stringify(fefo.body));
+  assert.equal(await sumOnHand(), sumBefore - (positive + 7));
+  // locking an order that has no stock behind it
+  const lockOrder = await newOrder(4);
+  const locked = await api('POST', `/api/sales-orders/${lockOrder.id}/lock`, { isLocked: true });
+  assert.equal(locked.status, 200, JSON.stringify(locked.body));
+
+  // back off: refused again
+  assert.equal((await api('PUT', '/api/settings', { allowNegativeStock: false })).status, 200);
+  const o2 = await newOrder(1);
+  const bad = await api('POST', '/api/orders/complete-pick', { orderId: o2.id, pickedItems: [{ batchNo: b.batchNo, sku, qty: 1 }] });
+  assert.equal(bad.status, 400);
+  assert.equal((await api('GET', '/api/settings')).body.allowNegativeStock, false);
+});
+
 // ------------------------------------------------------------------ database failure
 test('a failed database write changes nothing (rollback)', async () => {
   const b = await activeBatch();

@@ -121,7 +121,7 @@ const RULES: Rule[] = [
 
   // Anyone may edit their own profile; the handler refuses role/password/other-person changes unless Admin.
   { method: 'PUT', path: /^\/api\/users\/[^/]+$/, need: 'any' },
-  { method: '*', path: /^\/api\/(users|role-permissions)(\/|$)/, need: ['settings:manage'] }
+  { method: '*', path: /^\/api\/(users|role-permissions|settings)(\/|$)/, need: ['settings:manage'] }
 ];
 
 export function requiredPermissions(method: string, path: string): Need {

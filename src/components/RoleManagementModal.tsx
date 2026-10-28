@@ -55,6 +55,8 @@ interface RoleManagementModalProps {
   onToggleSafetyReorder?: (enabled: boolean) => void;
   enableInboundSupplier?: boolean;
   onToggleInboundSupplier?: (enabled: boolean) => void;
+  allowNegativeStock?: boolean;
+  onToggleAllowNegativeStock?: (enabled: boolean) => void;
   customRolePermissions?: Record<UserRole, WmsPermission[]>;
   onToggleRolePermission?: (role: UserRole, permission: WmsPermission) => void;
   onResetRolePermissions?: () => void;
@@ -87,6 +89,8 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
   onToggleSafetyReorder,
   enableInboundSupplier = true,
   onToggleInboundSupplier,
+  allowNegativeStock = false,
+  onToggleAllowNegativeStock,
   customRolePermissions,
   onToggleRolePermission,
   onResetRolePermissions
@@ -314,7 +318,7 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
         {activeTab === 'switch' && (
           <div className="space-y-4">
             {/* Optional Feature Toggles (Admin Controlled Ticketed Functions) */}
-            {(onToggleSafetyReorder || onToggleInboundSupplier) && (
+            {(onToggleSafetyReorder || onToggleInboundSupplier || onToggleAllowNegativeStock) && (
               <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl shadow-xs space-y-3">
                 <h4 className="font-extrabold text-slate-900 text-sm flex items-center space-x-2">
                   <ShieldAlert className="w-4 h-4 text-purple-600" />
@@ -339,6 +343,28 @@ export const RoleManagementModal: React.FC<RoleManagementModalProps> = ({
                       </p>
                       <div className="text-[11px] font-mono font-bold text-amber-800">
                         Status: {enableSafetyReorder ? 'Ticked (Enabled)' : 'Unticked (Disabled)'}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Toggle 3: Negative stock (kept on the service, Admin only) */}
+                  {onToggleAllowNegativeStock && (
+                    <div className="p-3 bg-white border border-rose-200 rounded-xl space-y-2 md:col-span-2">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-slate-800 text-xs">Allow Negative Stock</span>
+                        <input
+                          type="checkbox"
+                          checked={allowNegativeStock}
+                          onChange={(e) => onToggleAllowNegativeStock(e.target.checked)}
+                          className="w-4 h-4 text-rose-600 rounded border-slate-300 focus:ring-rose-500 cursor-pointer"
+                        />
+                      </div>
+                      <p className="text-[11px] text-slate-500 leading-tight">
+                        When ticked, picking, stock-out, stock-take subtract and order lock go through even if the batch has too little
+                        stock (the batch goes below zero). Unticked, they are refused. Applies to every computer.
+                      </p>
+                      <div className="text-[11px] font-mono font-bold text-rose-800">
+                        Status: {allowNegativeStock ? 'Ticked (Negative stock allowed)' : 'Unticked (Negative stock refused)'}
                       </div>
                     </div>
                   )}

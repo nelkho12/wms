@@ -58,6 +58,8 @@ let facilitiesState: WarehouseFacility[] = [];
 let zonesState: StorageZone[] = [];
 let deletedCategoriesState: string[] = [];
 let rolePermsState: RolePermissions = defaultRolePermissions();
+// Admin tick: when true, stock-out actions may take a batch below zero (default: refused).
+let allowNegativeStock = false;
 let authSecret = '';
 let mssqlSimulateOffline = false;
 
@@ -177,7 +179,8 @@ function stateForPersistence() {
 function currentMeta(): Record<string, string> {
   return {
     deletedCategories: JSON.stringify(deletedCategoriesState),
-    rolePermissions: JSON.stringify(rolePermsState)
+    rolePermissions: JSON.stringify(rolePermsState),
+    allowNegativeStock: JSON.stringify(allowNegativeStock)
   };
 }
 
@@ -202,8 +205,11 @@ async function reloadFromDb() {
   deletedCategoriesState = dc ? JSON.parse(dc) : [];
   const rp = await persistence.getMeta('rolePermissions');
   rolePermsState = rp ? { ...defaultRolePermissions(), ...JSON.parse(rp) } : defaultRolePermissions();
+  const an = await persistence.getMeta('allowNegativeStock');
+  allowNegativeStock = an ? JSON.parse(an) === true : false;
   if (dc) persistence.setSavedMeta('deletedCategories', dc);
   if (rp) persistence.setSavedMeta('rolePermissions', rp);
+  if (an) persistence.setSavedMeta('allowNegativeStock', an);
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +510,40 @@ app.post('/api/auth/change-password', (req, res) => {
     severity: 'INFO'
   });
   res.json({ success: true });
+});
+
+// GET/PUT /api/settings - warehouse-wide switches (only an Admin may change them)
+app.get('/api/settings', (req, res) => {
+  res.json({ allowNegativeStock });
+});
+app.put('/api/settings', (req, res) => {
+  const me = (req as any).user as StoredUser;
+  if (me.role !== 'Admin') {
+    return res.status(403).json({ error: 'Only an Admin can change warehouse settings.' });
+  }
+  const { allowNegativeStock: next } = req.body || {};
+  if (typeof next !== 'boolean') {
+    return res.status(400).json({ error: 'allowNegativeStock must be true or false.' });
+  }
+  if (next !== allowNegativeStock) {
+    allowNegativeStock = next;
+    auditLogsState.unshift({
+      id: `AUD-${uid()}`,
+      timestamp: nowStamp(),
+      userId: me.id,
+      userName: me.name,
+      userRole: me.role,
+      actionCategory: 'SYSTEM',
+      actionType: 'NEGATIVE_STOCK_SETTING',
+      targetEntity: 'Warehouse settings',
+      details: next
+        ? 'Negative stock ALLOWED: stock-outs may now take a batch below zero.'
+        : 'Negative stock NOT allowed: stock-outs are refused when a batch has too little stock.',
+      severity: next ? 'WARNING' : 'INFO',
+      ipAddress: String(req.ip || '').replace('::ffff:', '')
+    } as AuditLogEntry);
+  }
+  res.json({ allowNegativeStock });
 });
 
 // GET/PUT /api/role-permissions - which role may do what (shared by all computers)
@@ -862,7 +902,7 @@ app.post('/api/inventory/outbound', (req, res) => {
     if (chosen.status !== 'ACTIVE') {
       return res.status(400).json({ error: `Batch ${batchNo} is ${chosen.status} and cannot be shipped.` });
     }
-    if (chosen.quantityOnHand < qtyNum) {
+    if (chosen.quantityOnHand < qtyNum && !allowNegativeStock) {
       return res.status(400).json({
         error: `Insufficient stock in batch ${chosen.batchNo}. Available on hand: ${chosen.quantityOnHand}, Requested Outbound: ${qtyNum}.`
       });
@@ -872,10 +912,16 @@ app.post('/api/inventory/outbound', (req, res) => {
     // FEFO: take from the earliest best-before first and continue into the next batch if needed.
     const candidates = fefoBatches(sku);
     const totalAvailable = candidates.reduce((sum, b) => sum + b.quantityOnHand, 0);
-    if (candidates.length === 0) {
+    // With negative stock allowed, a SKU with no stock left may still ship from its earliest usable batch.
+    const fallback = allowNegativeStock
+      ? batchesState
+          .filter((b) => b.sku === sku && b.status === 'ACTIVE' && !isExpired(b.bestBeforeDate))
+          .sort((a, b) => new Date(a.bestBeforeDate).getTime() - new Date(b.bestBeforeDate).getTime())[0]
+      : undefined;
+    if (candidates.length === 0 && !fallback) {
       return res.status(400).json({ error: `No shippable (active, non-expired) batches with stock for SKU ${sku}.` });
     }
-    if (totalAvailable < qtyNum) {
+    if (totalAvailable < qtyNum && !allowNegativeStock) {
       return res.status(400).json({
         error: `Insufficient stock for SKU ${sku}. Shippable on hand: ${totalAvailable}, Requested Outbound: ${qtyNum}.`
       });
@@ -886,6 +932,12 @@ app.post('/api/inventory/outbound', (req, res) => {
       const take = Math.min(b.quantityOnHand, remaining);
       picks.push({ batch: b, qty: take });
       remaining -= take;
+    }
+    if (remaining > 0) {
+      // Negative stock allowed: the shortfall goes on the last batch used (or the fallback batch).
+      const last = picks.length ? picks[picks.length - 1] : null;
+      if (last) last.qty += remaining;
+      else picks.push({ batch: fallback!, qty: remaining });
     }
   }
 
@@ -1026,6 +1078,9 @@ app.post('/api/inventory/outbound', (req, res) => {
   if (skuAfter && (skuAfter.exactQty ?? 0) < 0) {
     warnings.push(`Open orders have reserved more ${sku} than is now in stock (short by ${Math.abs(skuAfter.exactQty!)}). Re-check allocations.`);
   }
+  picks.filter((p) => p.batch.quantityOnHand < 0).forEach((p) =>
+    warnings.push(`Batch ${p.batch.batchNo} is now NEGATIVE (${p.batch.quantityOnHand}). Negative stock is allowed by the Admin setting; receive or adjust stock to correct it.`)
+  );
 
   const auditEntry: AuditLogEntry = {
     id: `AUD-${uid()}`,
@@ -1107,7 +1162,7 @@ app.post('/api/inventory/adjust', (req, res) => {
       variance = qtyNum;
       targetBatch.quantityOnHand += qtyNum;
     } else {
-      if (qtyNum > prevQty) {
+      if (qtyNum > prevQty && !allowNegativeStock) {
         return res.status(400).json({ error: `Cannot subtract ${qtyNum}; batch ${targetBatch.batchNo} only has ${prevQty} on hand.` });
       }
       variance = -qtyNum;
@@ -2710,6 +2765,19 @@ app.post('/api/sales-orders/:id/lock', (req, res) => {
         deductions.push({ batch: b, qty: take, item });
         need -= take;
       }
+      if (need > 0 && allowNegativeStock) {
+        // Negative stock allowed: the shortfall is taken from the last batch used, or the earliest usable batch.
+        const lastForItem = [...deductions].reverse().find((d) => d.item === item);
+        const target =
+          lastForItem?.batch ||
+          batchesState
+            .filter((b) => b.sku === item.sku && b.status === 'ACTIVE' && !isExpired(b.bestBeforeDate))
+            .sort((a, b) => new Date(a.bestBeforeDate).getTime() - new Date(b.bestBeforeDate).getTime())[0];
+        if (target) {
+          deductions.push({ batch: target, qty: need, item });
+          need = 0;
+        }
+      }
       if (need > 0) missing.push(`${item.sku} (short by ${need})`);
     }
     if (missing.length) {
@@ -2858,7 +2926,7 @@ app.post('/api/orders/complete-pick', (req, res) => {
       return res.status(400).json({ error: `Batch ${batchNo} is ${batch.status} and cannot be picked.` });
     }
     const totalFromBatch = (perBatchTotal.get(batch) || 0) + q;
-    if (totalFromBatch > batch.quantityOnHand) {
+    if (totalFromBatch > batch.quantityOnHand && !allowNegativeStock) {
       return res.status(400).json({ error: `Batch ${batchNo} only has ${batch.quantityOnHand} on hand; ${totalFromBatch} was picked.` });
     }
     perBatchTotal.set(batch, totalFromBatch);

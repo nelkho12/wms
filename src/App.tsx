@@ -12,7 +12,7 @@ import { RoleManagementModal } from './components/RoleManagementModal';
 import { UserProfileModal } from './components/UserProfileModal';
 import { LoginModal } from './components/LoginModal';
 import { DataBackupModal } from './components/DataBackupModal';
-import { fetchInventory, fetchOrders, fetchAuditLogs, createAuditLogEntry, fetchUsers, createUser, updateUserProfile, deleteUser, fetchMe, saveRolePermissions, RolePermissionMap } from './services/api';
+import { fetchInventory, fetchOrders, fetchAuditLogs, createAuditLogEntry, fetchUsers, createUser, updateUserProfile, deleteUser, fetchMe, saveRolePermissions, fetchSettings, saveSettings, RolePermissionMap } from './services/api';
 import { AUTH_EXPIRED_EVENT, getToken, setToken } from './services/http';
 import { ProductSKU, Location, Batch, PickOrder, StockMovement, AuditLogEntry, AuditCategory, WarehouseFacility, StorageZone } from './types/wms';
 import { UserProfile, UserRole, WmsPermission, ROLE_DEFINITIONS } from './types/roles';
@@ -102,6 +102,26 @@ export default function App() {
     return saved !== null ? JSON.parse(saved) : true;
   });
 
+  // Admin tick kept on the service, so every computer follows the same rule.
+  const [allowNegativeStock, setAllowNegativeStock] = useState<boolean>(false);
+
+  const handleToggleAllowNegativeStock = async (enabled: boolean) => {
+    if (
+      enabled &&
+      !window.confirm(
+        'Allow negative stock?\n\nPicking, stock-out, stock-take subtract and order lock will no longer be refused when a batch has too little stock. The batch will go below zero. Every change is recorded in the audit log.'
+      )
+    ) {
+      return;
+    }
+    try {
+      const saved = await saveSettings({ allowNegativeStock: enabled });
+      setAllowNegativeStock(saved.allowNegativeStock);
+    } catch (err: any) {
+      window.alert(err?.message || 'Could not save the setting.');
+    }
+  };
+
   const handleToggleSafetyReorder = (enabled: boolean) => {
     setEnableSafetyReorder(enabled);
     localStorage.setItem('apex_enable_safety_reorder', JSON.stringify(enabled));
@@ -145,6 +165,12 @@ export default function App() {
       const orderData = await fetchOrders();
       if (orderData) {
         setOrders(orderData);
+      }
+
+      try {
+        setAllowNegativeStock((await fetchSettings()).allowNegativeStock);
+      } catch {
+        /* keep the last known value */
       }
 
       const logsData = await fetchAuditLogs();
@@ -522,6 +548,8 @@ export default function App() {
         onToggleSafetyReorder={handleToggleSafetyReorder}
         enableInboundSupplier={enableInboundSupplier}
         onToggleInboundSupplier={handleToggleInboundSupplier}
+        allowNegativeStock={allowNegativeStock}
+        onToggleAllowNegativeStock={currentUser.role === 'Admin' ? handleToggleAllowNegativeStock : undefined}
         customRolePermissions={customRolePermissions}
         onToggleRolePermission={handleToggleRolePermission}
         onResetRolePermissions={handleResetRolePermissions}
