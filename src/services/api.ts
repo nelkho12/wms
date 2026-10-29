@@ -1,9 +1,10 @@
 import { PickOrder, MssqlQueryResult, MssqlTableSchema, AuditLogEntry, AuditCategory, PurchaseOrder, ProductSKU, CustomerProfile } from '../types/wms';
 import { UserProfile, UserRole } from '../types/roles';
+import { apiFetch } from './http';
 
 export async function fetchInventory() {
   try {
-    const res = await fetch('/api/inventory');
+    const res = await apiFetch('/api/inventory');
     if (!res.ok) throw new Error('Failed to fetch inventory');
     return await res.json();
   } catch (err) {
@@ -23,7 +24,7 @@ export async function receiveInboundStock(data: {
   unitCost?: number;
   category?: string;
 }) {
-  const res = await fetch('/api/inventory/receive', {
+  const res = await apiFetch('/api/inventory/receive', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -36,7 +37,7 @@ export async function receiveInboundStock(data: {
 }
 
 export async function toggleBatchQuarantine(batchNo: string, quarantineReason?: string) {
-  const res = await fetch('/api/inventory/quarantine', {
+  const res = await apiFetch('/api/inventory/quarantine', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ batchNo, quarantineReason })
@@ -61,7 +62,7 @@ export async function outboundStock(data: {
   createSalesOrderRecord?: boolean;
   customerName?: string;
 }) {
-  const res = await fetch('/api/inventory/outbound', {
+  const res = await apiFetch('/api/inventory/outbound', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -74,7 +75,7 @@ export async function outboundStock(data: {
 }
 
 export async function fetchOrders(): Promise<PickOrder[]> {
-  const res = await fetch('/api/orders');
+  const res = await apiFetch('/api/orders');
   if (!res.ok) throw new Error('Failed to fetch orders');
   return await res.json();
 }
@@ -95,7 +96,7 @@ export async function createSalesOrder(data: {
     remark?: string;
   }>;
 }) {
-  const res = await fetch('/api/sales-orders', {
+  const res = await apiFetch('/api/sales-orders', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -118,7 +119,7 @@ export async function updateSalesOrderAllocation(orderId: string, data: {
     remark?: string;
   }>;
 }) {
-  const res = await fetch(`/api/sales-orders/${encodeURIComponent(orderId)}/allocation`, {
+  const res = await apiFetch(`/api/sales-orders/${encodeURIComponent(orderId)}/allocation`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -131,7 +132,7 @@ export async function updateSalesOrderAllocation(orderId: string, data: {
 }
 
 export async function autoAllocateSalesOrder(orderId: string) {
-  const res = await fetch(`/api/sales-orders/${encodeURIComponent(orderId)}/auto-allocate`, {
+  const res = await apiFetch(`/api/sales-orders/${encodeURIComponent(orderId)}/auto-allocate`, {
     method: 'POST'
   });
   if (!res.ok) {
@@ -142,7 +143,7 @@ export async function autoAllocateSalesOrder(orderId: string) {
 }
 
 export async function deleteSalesOrder(orderId: string) {
-  const res = await fetch(`/api/sales-orders/${encodeURIComponent(orderId)}`, {
+  const res = await apiFetch(`/api/sales-orders/${encodeURIComponent(orderId)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -153,7 +154,7 @@ export async function deleteSalesOrder(orderId: string) {
 }
 
 export async function lockSalesOrder(orderId: string, isLocked: boolean = true) {
-  const res = await fetch(`/api/sales-orders/${encodeURIComponent(orderId)}/lock`, {
+  const res = await apiFetch(`/api/sales-orders/${encodeURIComponent(orderId)}/lock`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ isLocked })
@@ -166,7 +167,7 @@ export async function lockSalesOrder(orderId: string, isLocked: boolean = true) 
 }
 
 export async function optimizePickRoute(orderId: string) {
-  const res = await fetch('/api/orders/optimize-route', {
+  const res = await apiFetch('/api/orders/optimize-route', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ orderId })
@@ -179,7 +180,7 @@ export async function optimizePickRoute(orderId: string) {
 }
 
 export async function completeOrderPicking(orderId: string, pickedItems: Array<{ batchNo: string; qty: number }>) {
-  const res = await fetch('/api/orders/complete-pick', {
+  const res = await apiFetch('/api/orders/complete-pick', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ orderId, pickedItems })
@@ -192,7 +193,7 @@ export async function completeOrderPicking(orderId: string, pickedItems: Array<{
 }
 
 export async function executeMssqlQuery(sql: string): Promise<MssqlQueryResult> {
-  const res = await fetch('/api/mssql/query', {
+  const res = await apiFetch('/api/mssql/query', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ sql })
@@ -220,7 +221,7 @@ export interface MssqlPingStatus {
 export async function pingMssqlBackend(): Promise<MssqlPingStatus> {
   const startTime = Date.now();
   try {
-    const res = await fetch('/api/mssql/ping', {
+    const res = await apiFetch('/api/mssql/ping', {
       headers: { 'Cache-Control': 'no-cache' }
     });
     const roundTrip = Date.now() - startTime;
@@ -251,7 +252,7 @@ export async function pingMssqlBackend(): Promise<MssqlPingStatus> {
 }
 
 export async function toggleSimulateMssqlOffline(): Promise<{ simulateOffline: boolean; message: string }> {
-  const res = await fetch('/api/mssql/toggle-simulate-offline', {
+  const res = await apiFetch('/api/mssql/toggle-simulate-offline', {
     method: 'POST'
   });
   if (!res.ok) throw new Error('Failed to toggle simulate offline');
@@ -259,13 +260,13 @@ export async function toggleSimulateMssqlOffline(): Promise<{ simulateOffline: b
 }
 
 export async function fetchMssqlSchema(): Promise<{ tables: MssqlTableSchema[]; serverVersion: string; databaseName: string }> {
-  const res = await fetch('/api/mssql/schema');
+  const res = await apiFetch('/api/mssql/schema');
   if (!res.ok) throw new Error('Failed to fetch MSSQL schema');
   return await res.json();
 }
 
 export async function askGeminiSqlAssistant(userPrompt: string): Promise<string> {
-  const res = await fetch('/api/gemini/sql-assistant', {
+  const res = await apiFetch('/api/gemini/sql-assistant', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ userPrompt })
@@ -279,7 +280,7 @@ export async function askGeminiSqlAssistant(userPrompt: string): Promise<string>
 }
 
 export async function fetchGeminiInventoryInsights(): Promise<string> {
-  const res = await fetch('/api/gemini/inventory-insights', {
+  const res = await apiFetch('/api/gemini/inventory-insights', {
     method: 'POST'
   });
   if (!res.ok) {
@@ -292,7 +293,7 @@ export async function fetchGeminiInventoryInsights(): Promise<string> {
 
 export async function fetchPurchaseOrders(): Promise<PurchaseOrder[]> {
   try {
-    const res = await fetch('/api/purchase-orders');
+    const res = await apiFetch('/api/purchase-orders');
     if (!res.ok) throw new Error('Failed to fetch purchase orders');
     return await res.json();
   } catch (err) {
@@ -312,7 +313,7 @@ export async function createPurchaseOrder(data: {
   destinationLocationId?: string;
   notes?: string;
 }): Promise<PurchaseOrder> {
-  const res = await fetch('/api/purchase-orders', {
+  const res = await apiFetch('/api/purchase-orders', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -326,7 +327,7 @@ export async function createPurchaseOrder(data: {
 }
 
 export async function deletePurchaseOrder(id: string): Promise<{ success: boolean; deletedId: string }> {
-  const res = await fetch(`/api/purchase-orders/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/purchase-orders/${encodeURIComponent(id)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -337,7 +338,7 @@ export async function deletePurchaseOrder(id: string): Promise<{ success: boolea
 }
 
 export async function clearStockMovements(): Promise<{ success: boolean; clearedCount: number }> {
-  const res = await fetch('/api/stock-movements', {
+  const res = await apiFetch('/api/stock-movements', {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -348,7 +349,7 @@ export async function clearStockMovements(): Promise<{ success: boolean; cleared
 }
 
 export async function syncCatcherGourmetMatrix(): Promise<{ success: boolean; message: string; skus: ProductSKU[] }> {
-  const res = await fetch('/api/matrix/sync', {
+  const res = await apiFetch('/api/matrix/sync', {
     method: 'POST'
   });
   if (!res.ok) {
@@ -369,7 +370,7 @@ export async function createSKU(skuData: {
   barcode: string;
   storageZone: 'COLD_STORAGE' | 'HIGH_VELOCITY' | 'DRY' | 'HAZMAT';
 }): Promise<ProductSKU> {
-  const res = await fetch('/api/skus', {
+  const res = await apiFetch('/api/skus', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(skuData)
@@ -391,7 +392,7 @@ export async function updateSKU(skuCode: string, skuData: {
   safetyStock?: number;
   storageZone?: 'COLD_STORAGE' | 'HIGH_VELOCITY' | 'DRY' | 'HAZMAT';
 }): Promise<ProductSKU> {
-  const res = await fetch(`/api/skus/${encodeURIComponent(skuCode)}`, {
+  const res = await apiFetch(`/api/skus/${encodeURIComponent(skuCode)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(skuData)
@@ -405,7 +406,7 @@ export async function updateSKU(skuCode: string, skuData: {
 }
 
 export async function renameCategory(oldCategory: string, newCategory: string) {
-  const res = await fetch('/api/categories/rename', {
+  const res = await apiFetch('/api/categories/rename', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ oldCategory, newCategory })
@@ -418,7 +419,7 @@ export async function renameCategory(oldCategory: string, newCategory: string) {
 }
 
 export async function deleteCategory(categoryName: string, reassignTo: string = 'General Products') {
-  const res = await fetch('/api/categories/delete', {
+  const res = await apiFetch('/api/categories/delete', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ categoryName, reassignTo })
@@ -432,7 +433,7 @@ export async function deleteCategory(categoryName: string, reassignTo: string = 
 
 export async function fetchAuditLogs(): Promise<AuditLogEntry[]> {
   try {
-    const res = await fetch('/api/audit-logs');
+    const res = await apiFetch('/api/audit-logs');
     if (!res.ok) throw new Error('Failed to fetch audit logs');
     return await res.json();
   } catch (err) {
@@ -452,7 +453,7 @@ export async function createAuditLogEntry(entry: {
   severity?: 'INFO' | 'WARNING' | 'CRITICAL';
 }): Promise<AuditLogEntry | null> {
   try {
-    const res = await fetch('/api/audit-logs', {
+    const res = await apiFetch('/api/audit-logs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(entry)
@@ -468,7 +469,7 @@ export async function createAuditLogEntry(entry: {
 
 export async function fetchUsers(): Promise<UserProfile[]> {
   try {
-    const res = await fetch('/api/users');
+    const res = await apiFetch('/api/users');
     if (!res.ok) throw new Error('Failed to fetch user profiles');
     return await res.json();
   } catch (err) {
@@ -484,8 +485,9 @@ export async function createUser(userData: {
   department?: string;
   shift?: string;
   badgeCode?: string;
+  password: string;
 }): Promise<UserProfile> {
-  const res = await fetch('/api/users', {
+  const res = await apiFetch('/api/users', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(userData)
@@ -498,8 +500,8 @@ export async function createUser(userData: {
   return result.user;
 }
 
-export async function updateUserProfile(id: string, updates: Partial<UserProfile>): Promise<UserProfile> {
-  const res = await fetch(`/api/users/${id}`, {
+export async function updateUserProfile(id: string, updates: Partial<UserProfile> & { password?: string }): Promise<UserProfile> {
+  const res = await apiFetch(`/api/users/${id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates)
@@ -513,7 +515,7 @@ export async function updateUserProfile(id: string, updates: Partial<UserProfile
 }
 
 export async function deleteUser(id: string): Promise<boolean> {
-  const res = await fetch(`/api/users/${id}`, {
+  const res = await apiFetch(`/api/users/${id}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -525,7 +527,7 @@ export async function deleteUser(id: string): Promise<boolean> {
 
 export async function fetchCustomers(): Promise<CustomerProfile[]> {
   try {
-    const res = await fetch('/api/customers');
+    const res = await apiFetch('/api/customers');
     if (!res.ok) throw new Error('Failed to fetch customers');
     return await res.json();
   } catch (err) {
@@ -546,7 +548,7 @@ export async function createCustomerProfile(data: {
   preferredZone?: string;
   notes?: string;
 }): Promise<CustomerProfile> {
-  const res = await fetch('/api/customers', {
+  const res = await apiFetch('/api/customers', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -560,7 +562,7 @@ export async function createCustomerProfile(data: {
 }
 
 export async function updateCustomerProfile(id: string, updates: Partial<CustomerProfile>): Promise<CustomerProfile> {
-  const res = await fetch(`/api/customers/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/customers/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates)
@@ -574,7 +576,7 @@ export async function updateCustomerProfile(id: string, updates: Partial<Custome
 }
 
 export async function deleteCustomerProfile(id: string): Promise<boolean> {
-  const res = await fetch(`/api/customers/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/customers/${encodeURIComponent(id)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -594,7 +596,7 @@ export async function adjustStock(data: {
   operator?: string;
   locationId?: string;
 }) {
-  const res = await fetch('/api/inventory/adjust', {
+  const res = await apiFetch('/api/inventory/adjust', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -611,7 +613,7 @@ export async function importSKUsFromCSV(
   operator?: string,
   mode: 'OVERWRITE' | 'SKIP_EXISTING' | 'MERGE_STOCK' = 'OVERWRITE'
 ) {
-  const res = await fetch('/api/inventory/import-skus', {
+  const res = await apiFetch('/api/inventory/import-skus', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items, operator, mode })
@@ -628,7 +630,7 @@ export async function importBatchesFromCSV(
   operator?: string,
   mode: 'OVERWRITE' | 'SKIP_EXISTING' | 'MERGE_STOCK' = 'OVERWRITE'
 ) {
-  const res = await fetch('/api/inventory/import-batches', {
+  const res = await apiFetch('/api/inventory/import-batches', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items, operator, mode })
@@ -648,7 +650,7 @@ export async function createLocation(data: {
   zone: string;
   capacityKg?: number;
 }) {
-  const res = await fetch('/api/locations', {
+  const res = await apiFetch('/api/locations', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -661,7 +663,7 @@ export async function createLocation(data: {
 }
 
 export async function updateLocation(id: string, updates: any) {
-  const res = await fetch(`/api/locations/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/locations/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates)
@@ -674,7 +676,7 @@ export async function updateLocation(id: string, updates: any) {
 }
 
 export async function deleteLocation(id: string) {
-  const res = await fetch(`/api/locations/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/locations/${encodeURIComponent(id)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -694,7 +696,7 @@ export async function createFacility(data: {
   status?: string;
   totalAreaSqFt?: number;
 }) {
-  const res = await fetch('/api/facilities', {
+  const res = await apiFetch('/api/facilities', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -707,7 +709,7 @@ export async function createFacility(data: {
 }
 
 export async function updateFacility(id: string, updates: any) {
-  const res = await fetch(`/api/facilities/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/facilities/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates)
@@ -720,7 +722,7 @@ export async function updateFacility(id: string, updates: any) {
 }
 
 export async function deleteFacility(id: string) {
-  const res = await fetch(`/api/facilities/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`/api/facilities/${encodeURIComponent(id)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -742,7 +744,7 @@ export async function createZone(data: {
   facilityId?: string;
   maxCapacityKg?: number;
 }) {
-  const res = await fetch('/api/zones', {
+  const res = await apiFetch('/api/zones', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
@@ -755,7 +757,7 @@ export async function createZone(data: {
 }
 
 export async function updateZone(code: string, updates: any) {
-  const res = await fetch(`/api/zones/${encodeURIComponent(code)}`, {
+  const res = await apiFetch(`/api/zones/${encodeURIComponent(code)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates)
@@ -768,7 +770,7 @@ export async function updateZone(code: string, updates: any) {
 }
 
 export async function deleteZone(code: string) {
-  const res = await fetch(`/api/zones/${encodeURIComponent(code)}`, {
+  const res = await apiFetch(`/api/zones/${encodeURIComponent(code)}`, {
     method: 'DELETE'
   });
   if (!res.ok) {
@@ -776,4 +778,94 @@ export async function deleteZone(code: string) {
     throw new Error(err.error || 'Failed to delete storage zone');
   }
   return await res.json();
+}
+
+
+// ---------------------------------------------------------------------------
+// Sign-in, password and role permissions
+// ---------------------------------------------------------------------------
+import type { WmsPermission } from '../types/roles';
+export type RolePermissionMap = Record<UserRole, WmsPermission[]>;
+
+async function errorText(res: Response, fallback: string): Promise<string> {
+  try {
+    const body = await res.json();
+    return body.error || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Is the service reachable at this address? (does not need a login) */
+export async function checkServer(): Promise<boolean> {
+  try {
+    const res = await apiFetch('/api/health');
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function loginRequest(email: string, password: string): Promise<{ token: string; user: UserProfile; rolePermissions: RolePermissionMap }> {
+  let res: Response;
+  try {
+    res = await apiFetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+  } catch {
+    throw new Error('Cannot reach the ApexWMS service. Check the server address and that the service is running.');
+  }
+  if (!res.ok) throw new Error(await errorText(res, 'Sign in failed.'));
+  return res.json();
+}
+
+export async function fetchMe(): Promise<{ user: UserProfile; rolePermissions: RolePermissionMap } | null> {
+  try {
+    const res = await apiFetch('/api/auth/me');
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function changeMyPassword(currentPassword: string, newPassword: string): Promise<void> {
+  const res = await apiFetch('/api/auth/change-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentPassword, newPassword })
+  });
+  if (!res.ok) throw new Error(await errorText(res, 'Could not change the password.'));
+}
+
+export interface WarehouseSettings {
+  allowNegativeStock: boolean;
+}
+
+export async function fetchSettings(): Promise<WarehouseSettings> {
+  const res = await apiFetch('/api/settings');
+  if (!res.ok) throw new Error(await errorText(res, 'Could not load settings.'));
+  return res.json();
+}
+
+export async function saveSettings(settings: WarehouseSettings): Promise<WarehouseSettings> {
+  const res = await apiFetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  });
+  if (!res.ok) throw new Error(await errorText(res, 'Could not save settings.'));
+  return res.json();
+}
+
+export async function saveRolePermissions(map: RolePermissionMap): Promise<RolePermissionMap> {
+  const res = await apiFetch('/api/role-permissions', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(map)
+  });
+  if (!res.ok) throw new Error(await errorText(res, 'Could not save role permissions.'));
+  return res.json();
 }

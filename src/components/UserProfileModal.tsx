@@ -18,12 +18,13 @@ import {
   AlertCircle
 } from 'lucide-react';
 import { UserProfile, UserRole, WmsPermission, ROLE_DEFINITIONS, AuditLogEntry, hasPermission } from '../types/roles';
+import { changeMyPassword } from '../services/api';
 
 interface UserProfileModalProps {
   isOpen: boolean;
   onClose: () => void;
   currentUser: UserProfile;
-  onEditUserProfile?: (id: string, updates: Partial<UserProfile>) => Promise<UserProfile | void>;
+  onEditUserProfile?: (id: string, updates: Partial<UserProfile> & { password?: string }) => Promise<UserProfile | void>;
   onLogout: () => void;
   onOpenSwitchUserModal: () => void;
   auditLogs?: AuditLogEntry[];
@@ -50,6 +51,32 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   const [editBadge, setEditBadge] = useState(currentUser.badgeCode || '');
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Change password form state
+  const [curPw, setCurPw] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [newPw2, setNewPw2] = useState('');
+  const [pwMessage, setPwMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [pwBusy, setPwBusy] = useState(false);
+
+  const submitPasswordChange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPwMessage(null);
+    if (newPw.length < 8) return setPwMessage({ ok: false, text: 'The new password must be at least 8 characters.' });
+    if (newPw !== newPw2) return setPwMessage({ ok: false, text: 'The two new passwords are not the same.' });
+    setPwBusy(true);
+    try {
+      await changeMyPassword(curPw, newPw);
+      setPwMessage({ ok: true, text: 'Password changed.' });
+      setCurPw('');
+      setNewPw('');
+      setNewPw2('');
+    } catch (err: any) {
+      setPwMessage({ ok: false, text: err.message });
+    } finally {
+      setPwBusy(false);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -397,6 +424,34 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
                 </button>
               </div>
 
+            </form>
+          )}
+
+          {/* Change my password (shown under the profile form) */}
+          {activeTab === 'edit' && (
+            <form onSubmit={submitPasswordChange} className="mt-6 pt-5 border-t border-slate-200 space-y-3">
+              <h4 className="font-extrabold text-slate-800 flex items-center">
+                <Key className="w-4 h-4 mr-1.5 text-indigo-600" /> Change My Password
+              </h4>
+              {pwMessage && (
+                <div className={`p-3 rounded-xl text-xs font-bold border ${pwMessage.ok ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-rose-50 border-rose-200 text-rose-800'}`}>
+                  {pwMessage.text}
+                </div>
+              )}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <input type="password" autoComplete="current-password" placeholder="Current password" value={curPw} onChange={(e) => setCurPw(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl p-2.5 text-slate-900 focus:bg-white focus:outline-none focus:border-indigo-600" />
+                <input type="password" autoComplete="new-password" placeholder="New password (min. 8)" value={newPw} onChange={(e) => setNewPw(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl p-2.5 text-slate-900 focus:bg-white focus:outline-none focus:border-indigo-600" />
+                <input type="password" autoComplete="new-password" placeholder="Repeat new password" value={newPw2} onChange={(e) => setNewPw2(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl p-2.5 text-slate-900 focus:bg-white focus:outline-none focus:border-indigo-600" />
+              </div>
+              <div className="flex justify-end">
+                <button type="submit" disabled={pwBusy || !curPw || !newPw}
+                  className="px-5 py-2 bg-slate-800 hover:bg-slate-900 text-white font-bold rounded-xl transition-all cursor-pointer disabled:opacity-50">
+                  {pwBusy ? 'Changing...' : 'Change Password'}
+                </button>
+              </div>
             </form>
           )}
 

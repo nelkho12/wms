@@ -1,7 +1,7 @@
 {
   "name": "apex-wms",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -9,7 +9,13 @@
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "node --import tsx --test tests/persistence.test.ts tests/api.test.mjs tests/firstrun.test.mjs",
+    "build:ui": "vite build",
+    "build:service": "esbuild server.ts --bundle --platform=node --format=cjs --external:vite --outfile=dist-service/server.cjs --sourcemap --log-level=warning",
+    "start:service": "node dist-service/server.cjs",
+    "desktop": "npm run build:ui && electron .",
+    "desktop:dist": "npm run build:ui && electron-builder --win --x64"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -20,6 +26,7 @@
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "mssql": "^12.7.13",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "vite": "^6.2.3"
@@ -27,12 +34,49 @@
   "devDependencies": {
     "@types/compression": "^1.8.1",
     "@types/express": "^4.17.21",
+    "@types/mssql": "^12.3.0",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
+    "electron": "^45.0.0",
+    "electron-builder": "^26.18.0",
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.3"
+  },
+  "description": "ApexWMS - warehouse management desktop app and SQL Server service",
+  "author": "MayraLab",
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "com.mayralab.apexwms",
+    "productName": "ApexWMS",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json",
+      "!**/node_modules/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "ApexWMS-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   }
 }

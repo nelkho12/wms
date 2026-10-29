@@ -1,7 +1,8 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
+import crypto from 'crypto';
 import compression from 'compression';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import {
   INITIAL_SKUS,
@@ -16,30 +17,398 @@ import {
   INITIAL_FACILITIES,
   INITIAL_ZONES
 } from './src/data/initialData';
-import { INITIAL_USERS, UserProfile, UserRole } from './src/types/roles';
+import { INITIAL_USERS, UserProfile, UserRole, WmsPermission } from './src/types/roles';
 import { calculateOptimizedPickRoute } from './src/utils/routeOptimizer';
 import { Batch, PickOrder, StockMovement, ProductSKU, Location, AuditLogEntry, PurchaseOrder, CustomerProfile, WarehouseFacility, StorageZone } from './src/types/wms';
+import { Persistence, MemoryStore, SqlServerStore, sqlConfigFromEnv, Store } from './server/store';
+import {
+  hashPassword,
+  verifyPassword,
+  passwordProblem,
+  signToken,
+  verifyToken,
+  throttleCheck,
+  throttleFail,
+  throttleClear,
+  requiredPermissions,
+  isAllowed,
+  defaultRolePermissions,
+  RolePermissions
+} from './server/auth';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+const TOKEN_HOURS = Number(process.env.SESSION_HOURS || 12);
 
+/** A user as stored in the database (includes the password hash, which is never sent to clients). */
+type StoredUser = UserProfile & { passwordHash?: string; disabled?: boolean };
+
+// In-memory working copy of the database. Every change is written to the database
+// before the response is sent (see the request pipeline below).
+let skusState: ProductSKU[] = [];
+let locationsState: Location[] = [];
+let batchesState: Batch[] = [];
+let ordersState: PickOrder[] = [];
+let stockMovementsState: StockMovement[] = [];
+let auditLogsState: AuditLogEntry[] = [];
+let purchaseOrdersState: PurchaseOrder[] = [];
+let usersState: StoredUser[] = [];
+let customersState: CustomerProfile[] = [];
+let facilitiesState: WarehouseFacility[] = [];
+let zonesState: StorageZone[] = [];
+let deletedCategoriesState: string[] = [];
+let rolePermsState: RolePermissions = defaultRolePermissions();
+// Admin tick: when true, stock-out actions may take a batch below zero (default: refused).
+let allowNegativeStock = false;
+let authSecret = '';
+let mssqlSimulateOffline = false;
+
+let store: Store;
+let persistence: Persistence;
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+/** Local server time as 'YYYY-MM-DD HH:mm:ss' (the PC's own timezone, e.g. Malaysia). */
+function nowStamp(): string {
+  const d = new Date();
+  const p = (v: number) => String(v).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+let uidCounter = 0;
+/** Short unique id fragment that cannot repeat (time + counter + random). */
+function uid(): string {
+  uidCounter = (uidCounter + 1) % 1296;
+  return (
+    Date.now().toString(36).toUpperCase() +
+    uidCounter.toString(36).toUpperCase().padStart(2, '0') +
+    crypto.randomBytes(2).toString('hex').toUpperCase()
+  );
+}
+
+/** Readable numeric id like ORD-48213 that is guaranteed not to exist yet. */
+function numId<T extends { id: string }>(prefix: string, existing: T[], key: (row: T) => string | undefined = (r) => r.id): string {
+  const taken = new Set(existing.map((r) => key(r)));
+  for (let i = 0; i < 50; i++) {
+    const candidate = `${prefix}-${Math.floor(10000 + Math.random() * 90000)}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${prefix}-${uid()}`;
+}
+
+const isValidDate = (v: any) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v) && !Number.isNaN(new Date(v).getTime());
+const todayStr = () => nowStamp().slice(0, 10);
+/** True when the best-before date is before today (expired stock is never shipped). */
+const isExpired = (bbd: string) => isValidDate(bbd) && bbd.slice(0, 10) < todayStr();
+
+function publicUser(u: StoredUser): UserProfile {
+  const { passwordHash, disabled, ...rest } = u as any;
+  return rest as UserProfile;
+}
+
+
+// --- stock helpers -----------------------------------------------------------
+const itemRequested = (i: any): number => Number(i.orderQtyCtn ?? i.requestedQty ?? 0);
+const itemFulfilled = (i: any): number => Number(i.fulfillmentQty ?? i.pickedQty ?? 0);
+const isPositive = (v: any): boolean => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) && Number(v) > 0;
+
+/** Batches that may be shipped, earliest best-before first (FEFO). Never quarantined, recalled or expired. */
+function fefoBatches(sku: string): Batch[] {
+  return batchesState
+    .filter((b) => b.sku === sku && b.status === 'ACTIVE' && b.quantityOnHand > 0 && !isExpired(b.bestBeforeDate))
+    .sort((a, b) => new Date(a.bestBeforeDate).getTime() - new Date(b.bestBeforeDate).getTime());
+}
+
+function recalcOrderTotals(order: PickOrder) {
+  let ordered = 0;
+  let allocated = 0;
+  let fulfilled = 0;
+  order.items.forEach((item) => {
+    ordered += itemRequested(item);
+    allocated += Number(item.allocateQty ?? 0);
+    fulfilled += itemFulfilled(item);
+  });
+  order.totalOrderCtn = ordered;
+  order.totalAllocatedCtn = allocated;
+  order.totalFulfilledCtn = fulfilled;
+  order.totalOutstandingCtn = Math.max(0, ordered - fulfilled);
+}
+
+/** Stock reserved for OTHER open orders for this SKU (not yet picked). */
+function reservedByOthers(sku: string, exceptOrderId: string): number {
+  let total = 0;
+  ordersState.forEach((o) => {
+    if (o.id === exceptOrderId) return;
+    if (o.status === 'CANCELLED' || o.status === 'COMPLETED' || o.status === 'DONE') return;
+    o.items.forEach((i) => {
+      if (i.sku !== sku) return;
+      total += Math.max(0, Number(i.allocateQty ?? i.requestedQty ?? 0) - itemFulfilled(i));
+    });
+  });
+  return total;
+}
+
+/** Shippable stock for a SKU that is not already reserved for other open orders. */
+function freeStockFor(sku: string, exceptOrderId: string): number {
+  const onHand = fefoBatches(sku).reduce((sum, b) => sum + b.quantityOnHand, 0);
+  return Math.max(0, onHand - reservedByOthers(sku, exceptOrderId));
+}
+
+function newMovement(m: Omit<StockMovement, 'id' | 'timestamp'>): StockMovement {
+  return { id: `LOG-${uid()}`, timestamp: nowStamp(), ...m };
+}
+
+function stateForPersistence() {
+  return {
+    skus: skusState,
+    locations: locationsState,
+    batches: batchesState,
+    orders: ordersState,
+    stockMovements: stockMovementsState,
+    auditLogs: auditLogsState,
+    purchaseOrders: purchaseOrdersState,
+    users: usersState,
+    customers: customersState,
+    facilities: facilitiesState,
+    zones: zonesState
+  };
+}
+
+function currentMeta(): Record<string, string> {
+  return {
+    deletedCategories: JSON.stringify(deletedCategoriesState),
+    rolePermissions: JSON.stringify(rolePermsState),
+    allowNegativeStock: JSON.stringify(allowNegativeStock)
+  };
+}
+
+function applyLoaded(s: any) {
+  skusState = s.skus;
+  locationsState = s.locations;
+  batchesState = s.batches;
+  ordersState = s.orders;
+  stockMovementsState = s.stockMovements;
+  auditLogsState = s.auditLogs;
+  purchaseOrdersState = s.purchaseOrders;
+  usersState = s.users;
+  customersState = s.customers;
+  facilitiesState = s.facilities;
+  zonesState = s.zones;
+}
+
+async function reloadFromDb() {
+  const loaded = await persistence.loadAll();
+  applyLoaded(loaded);
+  const dc = await persistence.getMeta('deletedCategories');
+  deletedCategoriesState = dc ? JSON.parse(dc) : [];
+  const rp = await persistence.getMeta('rolePermissions');
+  rolePermsState = rp ? { ...defaultRolePermissions(), ...JSON.parse(rp) } : defaultRolePermissions();
+  const an = await persistence.getMeta('allowNegativeStock');
+  allowNegativeStock = an ? JSON.parse(an) === true : false;
+  if (dc) persistence.setSavedMeta('deletedCategories', dc);
+  if (rp) persistence.setSavedMeta('rolePermissions', rp);
+  if (an) persistence.setSavedMeta('allowNegativeStock', an);
+}
+
+// ---------------------------------------------------------------------------
+// Start-up: connect to the database, load data, first-run seeding
+// ---------------------------------------------------------------------------
+async function initialize() {
+  const kind = (process.env.WMS_STORE || 'mssql').toLowerCase();
+  if (kind === 'memory') {
+    console.warn('[WMS] Using the in-memory store (data is lost on restart). For testing only.');
+    store = new MemoryStore();
+  } else {
+    const cfg = sqlConfigFromEnv(process.env);
+    if (!cfg.user || !cfg.password) {
+      throw new Error('MSSQL_USER and MSSQL_PASSWORD must be set in the .env file.');
+    }
+    console.log(`[WMS] Connecting to SQL Server ${cfg.server}${cfg.instanceName ? '\\' + cfg.instanceName : ':' + cfg.port}, database ${cfg.database} ...`);
+    store = new SqlServerStore(cfg);
+  }
+  await store.init();
+  persistence = new Persistence(store);
+  await reloadFromDb();
+
+  // Secret used to sign login tokens: from .env, otherwise generated once and kept in the database.
+  authSecret = process.env.AUTH_SECRET || (await persistence.getMeta('authSecret')) || '';
+  const meta: Record<string, string> = {};
+  if (!authSecret) {
+    authSecret = crypto.randomBytes(48).toString('base64url');
+    meta.authSecret = authSecret;
+  }
+
+  // First run: load starter data once.
+  const seeded = await persistence.getMeta('seeded');
+  if (!seeded) {
+    const mode = (process.env.SEED_MODE || 'master').toLowerCase(); // master | demo | none
+    if (mode !== 'none') {
+      if (skusState.length === 0) skusState = INITIAL_SKUS.map((x) => ({ ...x }));
+      if (locationsState.length === 0) locationsState = INITIAL_LOCATIONS.map((x) => ({ ...x }));
+      if (zonesState.length === 0) zonesState = INITIAL_ZONES.map((x) => ({ ...x }));
+      if (facilitiesState.length === 0) facilitiesState = INITIAL_FACILITIES.map((x) => ({ ...x }));
+      if (customersState.length === 0) customersState = INITIAL_CUSTOMERS.map((x) => ({ ...x }));
+      if (mode === 'demo') {
+        batchesState = batchesState.length ? batchesState : INITIAL_BATCHES.map((x) => ({ ...x }));
+        ordersState = ordersState.length ? ordersState : JSON.parse(JSON.stringify(INITIAL_ORDERS));
+        stockMovementsState = stockMovementsState.length ? stockMovementsState : INITIAL_STOCK_MOVEMENTS.map((x) => ({ ...x }));
+        auditLogsState = auditLogsState.length ? auditLogsState : INITIAL_AUDIT_LOGS.map((x) => ({ ...x }));
+        purchaseOrdersState = purchaseOrdersState.length ? purchaseOrdersState : INITIAL_PURCHASE_ORDERS.map((x) => ({ ...x }));
+        const demoPw = process.env.DEMO_USER_PASSWORD || 'Demo12345!';
+        INITIAL_USERS.forEach((u) => {
+          if (!usersState.some((x) => x.id === u.id)) usersState.push({ ...u, passwordHash: hashPassword(demoPw) });
+        });
+        console.log(`[WMS] Demo data loaded. Demo users (${INITIAL_USERS.map((u) => u.email).join(', ')}) have password: ${demoPw}`);
+      }
+    }
+    meta.seeded = (process.env.SEED_MODE || 'master').toLowerCase();
+  }
+
+  // First run: create the administrator account.
+  if (!usersState.some((u) => u.role === 'Admin' && !u.disabled)) {
+    const email = (process.env.ADMIN_EMAIL || 'admin@mayralab.local').trim();
+    let pw = process.env.ADMIN_PASSWORD || '';
+    let generated = false;
+    if (!pw) {
+      pw = crypto.randomBytes(9).toString('base64url');
+      generated = true;
+    }
+    usersState.push({
+      id: 'USR-ADMIN',
+      name: 'Administrator',
+      email,
+      role: 'Admin',
+      department: 'Management',
+      shift: 'Any',
+      badgeCode: 'BDG-ADMIN',
+      passwordHash: hashPassword(pw)
+    });
+    console.log('================================================================');
+    console.log(' First run: administrator account created');
+    console.log(`   Login:    ${email}`);
+    console.log(`   Password: ${generated ? pw + '   (generated - note it down and change it after login)' : '(from ADMIN_PASSWORD in .env)'}`);
+    console.log('================================================================');
+  }
+
+  await persistence.commit(stateForPersistence() as any, { ...currentMeta(), ...meta });
+  for (const [k, v] of Object.entries(meta)) persistence.setSavedMeta(k, v);
+}
+
+// ---------------------------------------------------------------------------
+// Request pipeline:  CORS -> sign-in check -> one-at-a-time lock -> handler
+//                    -> write changes to the database -> send the response
+// ---------------------------------------------------------------------------
+app.use((req, res, next) => {
+  // The desktop app is served from file:// and signs in with a bearer token (no cookies),
+  // so any origin may call the API; the token is what protects it.
+  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 
-// In-memory Database State
-let skusState: ProductSKU[] = [...INITIAL_SKUS];
-let locationsState: Location[] = [...INITIAL_LOCATIONS];
-let batchesState: Batch[] = [...INITIAL_BATCHES];
-let ordersState: PickOrder[] = [...INITIAL_ORDERS];
-let stockMovementsState: StockMovement[] = [...INITIAL_STOCK_MOVEMENTS];
-let auditLogsState: AuditLogEntry[] = [...INITIAL_AUDIT_LOGS];
-let purchaseOrdersState: PurchaseOrder[] = [...INITIAL_PURCHASE_ORDERS];
-let usersState: UserProfile[] = [...INITIAL_USERS];
-let customersState: CustomerProfile[] = [...INITIAL_CUSTOMERS];
-let facilitiesState: WarehouseFacility[] = [...INITIAL_FACILITIES];
-let zonesState: StorageZone[] = [...INITIAL_ZONES];
-let deletedCategoriesState: string[] = [];
-let mssqlSimulateOffline = false;
+let lockTail: Promise<void> = Promise.resolve();
+function acquireLock(): Promise<() => void> {
+  let release!: () => void;
+  const mine = new Promise<void>((r) => (release = r));
+  const prev = lockTail;
+  lockTail = lockTail.then(() => mine);
+  return prev.then(() => release);
+}
+
+const PUBLIC_API = new Set(['GET /api/health', 'POST /api/auth/login']);
+
+app.use('/api', async (req, res, next) => {
+  const full = `${req.method} /api${req.path}`.replace(/\/$/, '');
+  const isPublic = PUBLIC_API.has(full);
+
+  if (!isPublic) {
+    const header = String(req.headers.authorization || '');
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    const payload = token ? verifyToken(token, authSecret) : null;
+    const user = payload ? usersState.find((u) => u.id === payload.uid && !u.disabled) : undefined;
+    if (!user) {
+      return res.status(401).json({ error: 'Please sign in.', code: 'AUTH_REQUIRED' });
+    }
+    const need = requiredPermissions(req.method, `/api${req.path}`.replace(/\/$/, ''));
+    if (!isAllowed(user.role, need, rolePermsState)) {
+      return res.status(403).json({ error: `Your role (${user.role}) is not allowed to do this.` });
+    }
+    (req as any).user = user;
+  }
+
+  if (full === 'GET /api/health') return next();
+
+  // Everything else runs one request at a time, so two computers can never change
+  // the same stock at the same moment.
+  const release = await acquireLock();
+  let released = false;
+  const done = () => {
+    if (!released) {
+      released = true;
+      release();
+    }
+  };
+  res.on('close', done);
+
+  const firstAuditBefore = auditLogsState[0]?.id;
+  const origJson = res.json.bind(res);
+  let sent = false;
+  (res as any).json = (body: any) => {
+    if (sent) return res;
+    sent = true;
+    (async () => {
+      try {
+        if (res.statusCode >= 400 && !res.locals.keepChanges) {
+          // The request failed: throw away any half-finished changes.
+          const dirtyState = await persistenceIsDirty();
+          if (dirtyState) await reloadFromDb();
+        } else {
+          // Tag new audit entries with the signed-in user and their network address.
+          const u = (req as any).user as StoredUser | undefined;
+          for (const a of auditLogsState) {
+            if (a.id === firstAuditBefore) break;
+            if (u) {
+              a.userId = u.id;
+              a.userName = u.name;
+              a.userRole = u.role;
+            }
+            a.ipAddress = String(req.ip || '').replace('::ffff:', '');
+          }
+          await persistence.commit(stateForPersistence() as any, currentMeta());
+        }
+        origJson(body);
+      } catch (err: any) {
+        console.error('[WMS] Database write failed:', err?.message || err);
+        try {
+          await reloadFromDb();
+        } catch (e: any) {
+          console.error('[WMS] Reload after failure also failed:', e?.message || e);
+        }
+        res.status(503);
+        origJson({ error: 'The database could not save this change. Nothing was changed. Please try again.' });
+      } finally {
+        done();
+      }
+    })();
+    return res;
+  };
+  next();
+});
+
+async function persistenceIsDirty(): Promise<boolean> {
+  try {
+    return await persistence.hasChanges(stateForPersistence() as any, currentMeta());
+  } catch {
+    return true;
+  }
+}
 
 // Lazy Gemini AI Client initialization
 function getGenAIClient() {
@@ -56,22 +425,164 @@ function getGenAIClient() {
 }
 
 // ==========================================
+// SIGN-IN & PERMISSIONS
+// ==========================================
+
+// POST /api/auth/login - sign in with e-mail (or badge code) + password
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body || {};
+  const ident = String(email || '').trim().toLowerCase();
+  if (!ident || typeof password !== 'string' || !password) {
+    return res.status(400).json({ error: 'Enter your e-mail and password.' });
+  }
+
+  const throttleKey = `${ident}|${req.ip}`;
+  const wait = throttleCheck(throttleKey);
+  if (wait > 0) {
+    return res.status(429).json({ error: `Too many wrong passwords. Try again in ${wait} seconds.` });
+  }
+
+  const user = usersState.find((u) => !u.disabled && (u.email.toLowerCase() === ident || (u.badgeCode || '').toLowerCase() === ident));
+  // Always run the hash check so timing does not reveal whether the account exists.
+  const ok = verifyPassword(password, user?.passwordHash ?? hashPassword('x'));
+  if (!user || !ok) {
+    throttleFail(throttleKey);
+    auditLogsState.unshift({
+      id: `AUD-${uid()}`,
+      timestamp: nowStamp(),
+      userId: user?.id || 'UNKNOWN',
+      userName: user?.name || ident,
+      userRole: user?.role || 'Picker',
+      actionCategory: 'SYSTEM',
+      actionType: 'LOGIN_FAILED',
+      targetEntity: ident,
+      details: `Failed sign-in attempt for '${ident}'.`,
+      severity: 'WARNING',
+      ipAddress: String(req.ip || '').replace('::ffff:', '')
+    });
+    res.locals.keepChanges = true; // still record the failed attempt in the audit log
+    return res.status(401).json({ error: 'Wrong e-mail or password.' });
+  }
+
+  throttleClear(throttleKey);
+  const token = signToken({ uid: user.id, exp: Math.floor(Date.now() / 1000) + TOKEN_HOURS * 3600 }, authSecret);
+  auditLogsState.unshift({
+    id: `AUD-${uid()}`,
+    timestamp: nowStamp(),
+    userId: user.id,
+    userName: user.name,
+    userRole: user.role,
+    actionCategory: 'SYSTEM',
+    actionType: 'USER_LOGIN',
+    targetEntity: `User ${user.name}`,
+    details: `${user.name} (${user.role}) signed in.`,
+    severity: 'INFO',
+    ipAddress: String(req.ip || '').replace('::ffff:', '')
+  });
+  res.json({ token, user: publicUser(user), rolePermissions: rolePermsState });
+});
+
+// GET /api/auth/me - who am I (also used to check a saved token is still valid)
+app.get('/api/auth/me', (req, res) => {
+  res.json({ user: publicUser((req as any).user), rolePermissions: rolePermsState });
+});
+
+// POST /api/auth/change-password - change my own password
+app.post('/api/auth/change-password', (req, res) => {
+  const me = (req as any).user as StoredUser;
+  const { currentPassword, newPassword } = req.body || {};
+  if (!verifyPassword(String(currentPassword || ''), me.passwordHash)) {
+    return res.status(400).json({ error: 'Current password is wrong.' });
+  }
+  const problem = passwordProblem(newPassword);
+  if (problem) return res.status(400).json({ error: problem });
+  me.passwordHash = hashPassword(newPassword);
+  auditLogsState.unshift({
+    id: `AUD-${uid()}`,
+    timestamp: nowStamp(),
+    userId: me.id,
+    userName: me.name,
+    userRole: me.role,
+    actionCategory: 'ROLE_MANAGEMENT',
+    actionType: 'PASSWORD_CHANGED',
+    targetEntity: me.name,
+    details: `${me.name} changed their own password.`,
+    severity: 'INFO'
+  });
+  res.json({ success: true });
+});
+
+// GET/PUT /api/settings - warehouse-wide switches (only an Admin may change them)
+app.get('/api/settings', (req, res) => {
+  res.json({ allowNegativeStock });
+});
+app.put('/api/settings', (req, res) => {
+  const me = (req as any).user as StoredUser;
+  if (me.role !== 'Admin') {
+    return res.status(403).json({ error: 'Only an Admin can change warehouse settings.' });
+  }
+  const { allowNegativeStock: next } = req.body || {};
+  if (typeof next !== 'boolean') {
+    return res.status(400).json({ error: 'allowNegativeStock must be true or false.' });
+  }
+  if (next !== allowNegativeStock) {
+    allowNegativeStock = next;
+    auditLogsState.unshift({
+      id: `AUD-${uid()}`,
+      timestamp: nowStamp(),
+      userId: me.id,
+      userName: me.name,
+      userRole: me.role,
+      actionCategory: 'SYSTEM',
+      actionType: 'NEGATIVE_STOCK_SETTING',
+      targetEntity: 'Warehouse settings',
+      details: next
+        ? 'Negative stock ALLOWED: stock-outs may now take a batch below zero.'
+        : 'Negative stock NOT allowed: stock-outs are refused when a batch has too little stock.',
+      severity: next ? 'WARNING' : 'INFO',
+      ipAddress: String(req.ip || '').replace('::ffff:', '')
+    } as AuditLogEntry);
+  }
+  res.json({ allowNegativeStock });
+});
+
+// GET/PUT /api/role-permissions - which role may do what (shared by all computers)
+app.get('/api/role-permissions', (req, res) => {
+  res.json(rolePermsState);
+});
+app.put('/api/role-permissions', (req, res) => {
+  const incoming = req.body as RolePermissions;
+  const valid: WmsPermission[] = [
+    'inventory:read', 'inventory:write', 'inbound:receive', 'traceability:view', 'quarantine:manage',
+    'orders:view', 'orders:pick', 'orders:manage', 'mssql:console', 'settings:manage'
+  ];
+  const roles: UserRole[] = ['Admin', 'Warehouse Manager', 'Picker', 'Receiver'];
+  const next = {} as RolePermissions;
+  for (const r of roles) {
+    const list = incoming?.[r];
+    if (!Array.isArray(list) || list.some((p) => !valid.includes(p))) {
+      return res.status(400).json({ error: `Invalid permission list for role ${r}.` });
+    }
+    next[r] = [...new Set(list)];
+  }
+  // The Admin role can never lock itself out of user/permission management.
+  for (const must of ['settings:manage', 'inventory:read'] as WmsPermission[]) {
+    if (!next.Admin.includes(must)) next.Admin.push(must);
+  }
+  rolePermsState = next;
+  res.json(rolePermsState);
+});
+
+// ==========================================
 // API ROUTES
 // ==========================================
 
-// GET /api/health
+// GET /api/health  (no sign-in needed; used by the desktop app to test the server address)
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'online',
-    system: 'ApexWMS Server Engine',
-    timestamp: new Date().toISOString(),
-    dbType: 'MS SQL Server (Emulated T-SQL Engine)',
-    stats: {
-      totalSKUs: skusState.length,
-      totalBatches: batchesState.length,
-      totalLocations: locationsState.length,
-      totalOrders: ordersState.length
-    }
+    system: 'ApexWMS Service',
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -88,7 +599,7 @@ app.post('/api/customers', (req, res) => {
     return res.status(400).json({ error: 'Company Name is required.' });
   }
 
-  const id = `CUST-${Math.floor(1000 + Math.random() * 9000)}`;
+  const id = numId('CUST', customersState);
   const code = customerCode || `CUST-${companyName.slice(0, 3).toUpperCase()}`;
 
   const newCustomer: CustomerProfile = {
@@ -108,9 +619,9 @@ app.post('/api/customers', (req, res) => {
 
   customersState.unshift(newCustomer);
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Sales Operations Manager',
@@ -141,8 +652,8 @@ app.put('/api/customers/:id', (req, res) => {
   };
 
   auditLogsState.unshift({
-    id: `LOG-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    timestamp: new Date().toISOString(),
+    id: `LOG-${uid()}`,
+    timestamp: nowStamp(),
     userId: 'USR-101',
     userName: 'Operations Lead',
     userRole: 'Admin',
@@ -169,8 +680,8 @@ app.delete('/api/customers/:id', (req, res) => {
   const removed = customersState.splice(index, 1)[0];
 
   auditLogsState.unshift({
-    id: `LOG-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    timestamp: new Date().toISOString(),
+    id: `LOG-${uid()}`,
+    timestamp: nowStamp(),
     userId: 'USR-101',
     userName: 'Operations Lead',
     userRole: 'Admin',
@@ -228,8 +739,17 @@ app.get('/api/inventory', (req, res) => {
 app.post('/api/inventory/receive', (req, res) => {
   const { sku, batchNo, manufactureDate, bestBeforeDate, supplier, locationId, quantity, unitCost, category } = req.body;
 
-  if (!sku || !batchNo || !bestBeforeDate || !locationId || !quantity) {
+  if (!sku || !batchNo || !bestBeforeDate || !locationId || quantity === undefined || quantity === null || quantity === '') {
     return res.status(400).json({ error: 'Missing required fields: sku, batchNo, bestBeforeDate, locationId, quantity' });
+  }
+  if (!isPositive(quantity)) {
+    return res.status(400).json({ error: 'Quantity must be a number greater than 0.' });
+  }
+  if (!isValidDate(bestBeforeDate)) {
+    return res.status(400).json({ error: 'Best-before date is not a valid date (use YYYY-MM-DD).' });
+  }
+  if (manufactureDate && !isValidDate(manufactureDate)) {
+    return res.status(400).json({ error: 'Manufacture date is not a valid date (use YYYY-MM-DD).' });
   }
 
   const skuObj = skusState.find((s) => s.sku === sku);
@@ -241,22 +761,23 @@ app.post('/api/inventory/receive', (req, res) => {
     skuObj.category = category;
   }
 
-  const newLotId = `LOT-${Date.now().toString().slice(-6)}`;
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const qty = Number(quantity);
+  const newLotId = `LOT-${uid()}`;
+  const timestampStr = nowStamp();
 
   const newBatch: Batch = {
     id: newLotId,
-    batchNo,
+    batchNo: String(batchNo).trim(),
     sku,
     category: category || skuObj.category,
     itemName: skuObj.name,
-    manufactureDate: manufactureDate || new Date().toISOString().split('T')[0],
+    manufactureDate: manufactureDate || todayStr(),
     bestBeforeDate,
     supplier: supplier || 'Standard Supplier',
     locationId,
-    quantityOnHand: Number(quantity),
+    quantityOnHand: qty,
     quantityAllocated: 0,
-    quantityAvailable: Number(quantity),
+    quantityAvailable: qty,
     unitCost: Number(unitCost || 5.0),
     status: 'ACTIVE',
     receivedAt: timestampStr,
@@ -265,67 +786,70 @@ app.post('/api/inventory/receive', (req, res) => {
 
   batchesState.unshift(newBatch);
 
-  // Add stock movement log
-  const newLog: StockMovement = {
-    id: `LOG-${Date.now().toString().slice(-6)}`,
-    timestamp: timestampStr,
+  const newLog = newMovement({
     type: 'INBOUND_RECEIVE',
     sku,
     itemName: skuObj.name,
-    batchNo,
+    batchNo: newBatch.batchNo,
     toLocation: locationId,
-    quantity: Number(quantity),
-    operator: 'Floor Op (Mobile Scanner)',
+    quantity: qty,
+    operator: (req as any).user?.name || 'Floor Op (Mobile Scanner)',
     referenceDoc: `PO-INBOUND-${Math.floor(1000 + Math.random() * 9000)}`
-  };
+  });
 
   stockMovementsState.unshift(newLog);
 
   res.json({ success: true, batch: newBatch, movement: newLog });
 });
 
-// POST /api/inventory/quarantine - Quarantine hold for product recall & traceability
+// POST /api/inventory/quarantine - Quarantine hold / release for product recall & traceability
+//   body: { batchNo, sku?, quarantineReason?, action?: 'HOLD' | 'RELEASE' }
+//   Without `action` it flips the current state (what the screen's button does).
 app.post('/api/inventory/quarantine', (req, res) => {
-  const { batchNo, quarantineReason } = req.body;
+  const { batchNo, sku, quarantineReason, action } = req.body;
 
-  const targetBatches = batchesState.filter((b) => b.batchNo === batchNo);
+  if (!batchNo) return res.status(400).json({ error: 'batchNo is required.' });
+  if (action !== undefined && action !== 'HOLD' && action !== 'RELEASE') {
+    return res.status(400).json({ error: "action must be 'HOLD' or 'RELEASE'." });
+  }
+
+  const targetBatches = batchesState.filter((b) => b.batchNo === batchNo && (!sku || b.sku === sku));
   if (targetBatches.length === 0) {
     return res.status(404).json({ error: `Batch No ${batchNo} not found.` });
   }
+  if (targetBatches.some((b) => b.status === 'RECALLED' || b.status === 'EXPIRED')) {
+    return res.status(400).json({ error: `Batch ${batchNo} is ${targetBatches.find((b) => b.status === 'RECALLED' || b.status === 'EXPIRED')!.status} and cannot be held or released here.` });
+  }
 
-  let updatedCount = 0;
+  const hold = action ? action === 'HOLD' : targetBatches[0].status !== 'QUARANTINED';
+  const newStatus: Batch['status'] = hold ? 'QUARANTINED' : 'ACTIVE';
+
   targetBatches.forEach((batch) => {
-    batch.status = batch.status === 'QUARANTINED' ? 'ACTIVE' : 'QUARANTINED';
-    if (batch.status === 'QUARANTINED') {
-      batch.quantityAvailable = 0; // Lock available stock
-    } else {
-      batch.quantityAvailable = batch.quantityOnHand - batch.quantityAllocated;
-    }
-    batch.notes = quarantineReason ? `Quarantine Notice: ${quarantineReason}` : batch.notes;
-    updatedCount++;
+    batch.status = newStatus;
+    batch.quantityAvailable = hold ? 0 : Math.max(0, batch.quantityOnHand - batch.quantityAllocated);
+    batch.notes = quarantineReason ? `${hold ? 'Quarantine Notice' : 'Release Note'}: ${quarantineReason}` : batch.notes;
   });
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const movementLog: StockMovement = {
-    id: `LOG-${Date.now().toString().slice(-6)}`,
-    timestamp: timestampStr,
-    type: 'QUARANTINE_HOLD',
+  const movementLog = newMovement({
+    type: hold ? 'QUARANTINE_HOLD' : 'QUARANTINE_RELEASE',
     sku: targetBatches[0].sku,
     itemName: targetBatches[0].itemName,
     batchNo,
-    toLocation: 'QUARANTINE_LOCKER',
-    quantity: targetBatches[0].quantityOnHand,
-    operator: 'QA Safety Auditor',
-    referenceDoc: `RECALL-${Math.floor(100 + Math.random() * 900)}`
-  };
+    fromLocation: hold ? undefined : 'QUARANTINE_LOCKER',
+    toLocation: hold ? 'QUARANTINE_LOCKER' : targetBatches[0].locationId,
+    quantity: targetBatches.reduce((sum, b) => sum + b.quantityOnHand, 0),
+    operator: (req as any).user?.name || 'QA Safety Auditor',
+    referenceDoc: `${hold ? 'RECALL' : 'RELEASE'}-${Math.floor(100 + Math.random() * 900)}`
+  });
 
   stockMovementsState.unshift(movementLog);
+  syncInventoryAndMatrixState();
 
   res.json({
     success: true,
     batchNo,
-    newStatus: targetBatches[0].status,
-    updatedCount,
+    newStatus,
+    updatedCount: targetBatches.length,
     movementLog
   });
 });
@@ -346,133 +870,151 @@ app.post('/api/inventory/outbound', (req, res) => {
     customerName
   } = req.body;
 
-  const qtyNum = Number(quantity);
-  if (!sku || isNaN(qtyNum) || qtyNum <= 0) {
+  if (!sku || !isPositive(quantity)) {
     return res.status(400).json({ error: 'Missing required fields or invalid quantity (> 0).' });
   }
+  const qtyNum = Number(quantity);
 
   const skuObj = skusState.find((s) => s.sku === sku);
   if (!skuObj) {
     return res.status(404).json({ error: `SKU ${sku} not found in inventory master.` });
   }
 
-  // Find targeted batch or use FEFO (earliest bestBeforeDate)
-  let targetBatch: Batch | null = null;
+  // 1) Check the sales order FIRST, so a typo can never ship stock without an order.
+  let existingOrder: PickOrder | null = null;
+  if (salesOrderId) {
+    existingOrder = ordersState.find((o) => o.id === salesOrderId || o.salesOrderNo === salesOrderId) || null;
+    if (!existingOrder) {
+      return res.status(404).json({ error: `Sales Order ${salesOrderId} not found. Nothing was shipped.` });
+    }
+    if (existingOrder.isLocked) {
+      return res.status(400).json({ error: `Sales Order ${salesOrderId} is locked. Unlock it first.` });
+    }
+  }
+
+  // 2) Decide which batch(es) the stock comes from.
+  const picks: Array<{ batch: Batch; qty: number }> = [];
   if (batchNo && batchNo !== 'AUTO_FEFO') {
-    targetBatch = batchesState.find((b) => b.batchNo === batchNo && b.status !== 'QUARANTINED') || null;
-    if (!targetBatch) {
-      return res.status(404).json({ error: `Active batch ${batchNo} not found or is currently quarantined.` });
+    const chosen = batchesState.find((b) => b.batchNo === batchNo && b.sku === sku);
+    if (!chosen) {
+      return res.status(404).json({ error: `Batch ${batchNo} for SKU ${sku} not found.` });
     }
+    if (chosen.status !== 'ACTIVE') {
+      return res.status(400).json({ error: `Batch ${batchNo} is ${chosen.status} and cannot be shipped.` });
+    }
+    if (chosen.quantityOnHand < qtyNum && !allowNegativeStock) {
+      return res.status(400).json({
+        error: `Insufficient stock in batch ${chosen.batchNo}. Available on hand: ${chosen.quantityOnHand}, Requested Outbound: ${qtyNum}.`
+      });
+    }
+    picks.push({ batch: chosen, qty: qtyNum });
   } else {
-    // Select earliest expiry non-quarantined batch with stock
-    const candidateBatches = batchesState
-      .filter((b) => b.sku === sku && b.status !== 'QUARANTINED' && b.quantityOnHand > 0)
-      .sort((a, b) => new Date(a.bestBeforeDate).getTime() - new Date(b.bestBeforeDate).getTime());
-    
-    if (candidateBatches.length === 0) {
-      return res.status(400).json({ error: `No active on-hand batches found for SKU ${sku}.` });
+    // FEFO: take from the earliest best-before first and continue into the next batch if needed.
+    const candidates = fefoBatches(sku);
+    const totalAvailable = candidates.reduce((sum, b) => sum + b.quantityOnHand, 0);
+    // With negative stock allowed, a SKU with no stock left may still ship from its earliest usable batch.
+    const fallback = allowNegativeStock
+      ? batchesState
+          .filter((b) => b.sku === sku && b.status === 'ACTIVE' && !isExpired(b.bestBeforeDate))
+          .sort((a, b) => new Date(a.bestBeforeDate).getTime() - new Date(b.bestBeforeDate).getTime())[0]
+      : undefined;
+    if (candidates.length === 0 && !fallback) {
+      return res.status(400).json({ error: `No shippable (active, non-expired) batches with stock for SKU ${sku}.` });
     }
-    targetBatch = candidateBatches[0];
+    if (totalAvailable < qtyNum && !allowNegativeStock) {
+      return res.status(400).json({
+        error: `Insufficient stock for SKU ${sku}. Shippable on hand: ${totalAvailable}, Requested Outbound: ${qtyNum}.`
+      });
+    }
+    let remaining = qtyNum;
+    for (const b of candidates) {
+      if (remaining <= 0) break;
+      const take = Math.min(b.quantityOnHand, remaining);
+      picks.push({ batch: b, qty: take });
+      remaining -= take;
+    }
+    if (remaining > 0) {
+      // Negative stock allowed: the shortfall goes on the last batch used (or the fallback batch).
+      const last = picks.length ? picks[picks.length - 1] : null;
+      if (last) last.qty += remaining;
+      else picks.push({ batch: fallback!, qty: remaining });
+    }
   }
 
-  if (targetBatch.quantityOnHand < qtyNum) {
-    return res.status(400).json({
-      error: `Insufficient stock in batch ${targetBatch.batchNo}. Available on hand: ${targetBatch.quantityOnHand}, Requested Outbound: ${qtyNum}.`
-    });
-  }
-
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const purposeStr = outboundPurpose || 'Loose Stock Out Request';
   const remarkStr = remark ? String(remark).trim() : 'No remark specified';
   const destLocation = destination || 'Outbound Loose Dispatch Area';
-  const opName = operator || 'Warehouse Dispatch Operator';
+  const opName = operator || (req as any).user?.name || 'Warehouse Dispatch Operator';
 
-  // Deduct physical batch stock
-  targetBatch.quantityOnHand -= qtyNum;
-  targetBatch.quantityAllocated = Math.max(0, targetBatch.quantityAllocated - qtyNum);
-  targetBatch.quantityAvailable = Math.max(0, targetBatch.quantityOnHand - targetBatch.quantityAllocated);
+  // 3) Deduct physical batch stock.
+  picks.forEach(({ batch, qty }) => {
+    batch.quantityOnHand -= qty;
+    batch.quantityAvailable = Math.max(0, batch.quantityOnHand - batch.quantityAllocated);
+  });
+  const targetBatch = picks[0].batch;
+  const batchList = picks.map((p) => `${p.batch.batchNo} x${p.qty}`).join(', ');
 
   let linkedOrder: PickOrder | null = null;
   let referenceDocNumber = `OUT-LOOSE-${Math.floor(1000 + Math.random() * 9000)}`;
 
   // Case 1: Linked to an existing Sales Order
-  if (salesOrderId) {
-    const orderIndex = ordersState.findIndex((o) => o.id === salesOrderId || o.salesOrderNo === salesOrderId);
-    if (orderIndex !== -1) {
-      linkedOrder = ordersState[orderIndex];
-      referenceDocNumber = linkedOrder.salesOrderNo || linkedOrder.id;
+  if (existingOrder) {
+    linkedOrder = existingOrder;
+    referenceDocNumber = linkedOrder.salesOrderNo || linkedOrder.id;
 
-      // Find target line item in the sales order
-      let targetItem = salesOrderItemId
-        ? linkedOrder.items.find((i) => i.id === salesOrderItemId)
-        : linkedOrder.items.find((i) => i.sku === sku);
+    // Find target line item in the sales order
+    let targetItem = salesOrderItemId
+      ? linkedOrder.items.find((i) => i.id === salesOrderItemId)
+      : linkedOrder.items.find((i) => i.sku === sku);
 
-      if (!targetItem) {
-        // If not found in order, add as an additional loose item row
-        targetItem = {
-          id: `ITEM-${linkedOrder.id}-${linkedOrder.items.length + 1}`,
-          sku,
-          itemName: skuObj.name,
-          requestedQty: qtyNum,
-          orderQtyCtn: qtyNum,
-          allocateQty: qtyNum,
-          fulfillmentQty: qtyNum,
-          outstandingQty: 0,
-          pickedQty: qtyNum,
-          isPicked: true,
-          remark: `[Loose Out: ${purposeStr}] ${remarkStr}`
-        };
-        linkedOrder.items.push(targetItem);
-      } else {
-        // Update existing item fulfillment
-        targetItem.fulfillmentQty = (targetItem.fulfillmentQty || 0) + qtyNum;
-        targetItem.pickedQty = (targetItem.pickedQty || 0) + qtyNum;
-        const requested = targetItem.orderQtyCtn ?? targetItem.requestedQty ?? 0;
-        targetItem.outstandingQty = Math.max(0, requested - targetItem.fulfillmentQty);
-        targetItem.isPicked = targetItem.fulfillmentQty >= requested;
-        
-        const timestampNote = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        targetItem.remark = targetItem.remark
-          ? `${targetItem.remark} | [${timestampNote} Loose Out ${qtyNum} CTN (${purposeStr}): ${remarkStr}]`
-          : `[Loose Out ${qtyNum} CTN (${purposeStr}): ${remarkStr}]`;
-      }
+    if (!targetItem) {
+      // If not found in order, add as an additional loose item row
+      targetItem = {
+        id: `ITEM-${linkedOrder.id}-${linkedOrder.items.length + 1}`,
+        sku,
+        itemName: skuObj.name,
+        requestedQty: qtyNum,
+        orderQtyCtn: qtyNum,
+        allocateQty: qtyNum,
+        fulfillmentQty: qtyNum,
+        outstandingQty: 0,
+        pickedQty: qtyNum,
+        isPicked: true,
+        remark: `[Loose Out: ${purposeStr}] ${remarkStr}`
+      };
+      linkedOrder.items.push(targetItem);
+    } else {
+      // Update existing item fulfillment
+      targetItem.fulfillmentQty = (targetItem.fulfillmentQty || 0) + qtyNum;
+      targetItem.pickedQty = (targetItem.pickedQty || 0) + qtyNum;
+      const requested = targetItem.orderQtyCtn ?? targetItem.requestedQty ?? 0;
+      targetItem.outstandingQty = Math.max(0, requested - targetItem.fulfillmentQty);
+      targetItem.isPicked = targetItem.fulfillmentQty >= requested;
 
-      // Recalculate sales order totals
-      let totalOrderCtn = 0;
-      let totalAllocatedCtn = 0;
-      let totalFulfilledCtn = 0;
-
-      linkedOrder.items.forEach((item) => {
-        const oQty = item.orderQtyCtn ?? item.requestedQty ?? 0;
-        const aQty = item.allocateQty ?? 0;
-        const fQty = item.fulfillmentQty ?? item.pickedQty ?? 0;
-
-        totalOrderCtn += oQty;
-        totalAllocatedCtn += aQty;
-        totalFulfilledCtn += fQty;
-      });
-
-      linkedOrder.totalOrderCtn = totalOrderCtn;
-      linkedOrder.totalAllocatedCtn = totalAllocatedCtn;
-      linkedOrder.totalFulfilledCtn = totalFulfilledCtn;
-      linkedOrder.totalOutstandingCtn = Math.max(0, totalOrderCtn - totalFulfilledCtn);
-
-      // Update Sales Order status
-      if (totalFulfilledCtn >= totalOrderCtn && totalOrderCtn > 0) {
-        linkedOrder.fulfillmentStatus = 'FULFILLED';
-        linkedOrder.status = 'DONE';
-      } else {
-        linkedOrder.fulfillmentStatus = 'PARTIAL';
-      }
-
-      linkedOrder.remark = linkedOrder.remark
-        ? `${linkedOrder.remark} | [Loose Outbound: ${qtyNum} CTN of ${sku} (${purposeStr})]`
-        : `[Loose Outbound: ${qtyNum} CTN of ${sku} (${purposeStr}): ${remarkStr}]`;
+      const timestampNote = timestampStr.slice(11, 16);
+      targetItem.remark = targetItem.remark
+        ? `${targetItem.remark} | [${timestampNote} Loose Out ${qtyNum} CTN (${purposeStr}): ${remarkStr}]`
+        : `[Loose Out ${qtyNum} CTN (${purposeStr}): ${remarkStr}]`;
     }
+
+    recalcOrderTotals(linkedOrder);
+
+    // Update Sales Order status
+    if ((linkedOrder.totalFulfilledCtn || 0) >= (linkedOrder.totalOrderCtn || 0) && (linkedOrder.totalOrderCtn || 0) > 0) {
+      linkedOrder.fulfillmentStatus = 'FULFILLED';
+      linkedOrder.status = 'DONE';
+    } else {
+      linkedOrder.fulfillmentStatus = 'PARTIAL';
+    }
+
+    linkedOrder.remark = linkedOrder.remark
+      ? `${linkedOrder.remark} | [Loose Outbound: ${qtyNum} CTN of ${sku} (${purposeStr})]`
+      : `[Loose Outbound: ${qtyNum} CTN of ${sku} (${purposeStr}): ${remarkStr}]`;
   } else if (createSalesOrderRecord) {
     // Case 2: Standalone loose outbound with option to create a tracked Sales Order record
-    const soNumber = `SO-LOOSE-${Math.floor(1000 + Math.random() * 9000)}`;
-    const newOrderId = `ORD-${Math.floor(9000 + Math.random() * 1000)}`;
+    const soNumber = numId('SO-LOOSE', ordersState, (o) => o.salesOrderNo);
+    const newOrderId = numId('ORD', ordersState);
     referenceDocNumber = soNumber;
 
     linkedOrder = {
@@ -511,28 +1053,37 @@ app.post('/api/inventory/outbound', (req, res) => {
     ordersState.unshift(linkedOrder);
   }
 
-  // Create Stock Movement log
-  const movementLog: StockMovement = {
-    id: `LOG-${Date.now().toString().slice(-6)}`,
-    timestamp: timestampStr,
-    type: 'DISPATCH',
-    sku,
-    itemName: skuObj.name,
-    batchNo: targetBatch.batchNo,
-    fromLocation: targetBatch.locationId,
-    toLocation: destLocation,
-    quantity: qtyNum,
-    operator: opName,
-    referenceDoc: referenceDocNumber
-  };
-  stockMovementsState.unshift(movementLog);
+  // 4) One stock movement per batch the stock came from.
+  const movements = picks.map(({ batch, qty }) =>
+    newMovement({
+      type: 'DISPATCH',
+      sku,
+      itemName: skuObj.name,
+      batchNo: batch.batchNo,
+      fromLocation: batch.locationId,
+      toLocation: destLocation,
+      quantity: qty,
+      operator: opName,
+      referenceDoc: referenceDocNumber
+    })
+  );
+  movements.slice().reverse().forEach((m) => stockMovementsState.unshift(m));
+  const movementLog = movements[0];
 
   // Sync entire inventory balance matrix & reserved calculations
   syncInventoryAndMatrixState();
 
-  // Create Audit Log Entry
+  const warnings: string[] = [];
+  const skuAfter = skusState.find((s) => s.sku === sku);
+  if (skuAfter && (skuAfter.exactQty ?? 0) < 0) {
+    warnings.push(`Open orders have reserved more ${sku} than is now in stock (short by ${Math.abs(skuAfter.exactQty!)}). Re-check allocations.`);
+  }
+  picks.filter((p) => p.batch.quantityOnHand < 0).forEach((p) =>
+    warnings.push(`Batch ${p.batch.batchNo} is now NEGATIVE (${p.batch.quantityOnHand}). Negative stock is allowed by the Admin setting; receive or adjust stock to correct it.`)
+  );
+
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-OPERATOR-101',
     userName: opName,
@@ -540,7 +1091,7 @@ app.post('/api/inventory/outbound', (req, res) => {
     actionCategory: 'INVENTORY',
     actionType: 'STOCK_OUT_DISPATCH',
     targetEntity: `${sku} / ${targetBatch.batchNo}`,
-    details: `Outbound loose stock of ${qtyNum} CTN (${purposeStr}). Remark: "${remarkStr}". Deducted from Lot ${targetBatch.batchNo} at ${targetBatch.locationId}. ${
+    details: `Outbound loose stock of ${qtyNum} CTN (${purposeStr}). Remark: "${remarkStr}". Deducted from ${batchList}. ${
       linkedOrder ? `Updated Sales Order ${linkedOrder.salesOrderNo || linkedOrder.id}.` : ''
     }`,
     severity: 'INFO'
@@ -549,9 +1100,12 @@ app.post('/api/inventory/outbound', (req, res) => {
 
   res.json({
     success: true,
-    message: `Successfully outbounded ${qtyNum} CTN of ${skuObj.name} (Lot ${targetBatch.batchNo}).`,
+    message: `Successfully outbounded ${qtyNum} CTN of ${skuObj.name} (${picks.length > 1 ? 'Lots ' : 'Lot '}${picks.map((p) => p.batch.batchNo).join(', ')}).`,
     batch: targetBatch,
+    batchesUsed: picks.map((p) => ({ batchNo: p.batch.batchNo, qty: p.qty })),
+    warnings,
     movement: movementLog,
+    movements,
     order: linkedOrder,
     skus: skusState,
     batches: batchesState,
@@ -564,8 +1118,19 @@ app.post('/api/inventory/outbound', (req, res) => {
 app.post('/api/inventory/adjust', (req, res) => {
   const { sku, batchNo, adjustmentType, countedQuantity, reasonCode, notes, operator, locationId } = req.body;
 
-  if (!sku || countedQuantity === undefined || countedQuantity === null) {
+  if (!sku || countedQuantity === undefined || countedQuantity === null || countedQuantity === '') {
     return res.status(400).json({ error: 'Missing required fields: sku, countedQuantity' });
+  }
+
+  const type: 'SET_EXACT' | 'ADD' | 'SUBTRACT' = adjustmentType || 'SET_EXACT';
+  if (!['SET_EXACT', 'ADD', 'SUBTRACT'].includes(type)) {
+    return res.status(400).json({ error: `Unknown adjustment type '${type}'.` });
+  }
+  const qtyNum = Number(countedQuantity);
+  if (!Number.isFinite(qtyNum) || qtyNum < 0 || (type !== 'SET_EXACT' && qtyNum === 0)) {
+    return res.status(400).json({
+      error: type === 'SET_EXACT' ? 'Counted quantity must be a number, 0 or more.' : 'Quantity must be a number greater than 0.'
+    });
   }
 
   const skuObj = skusState.find((s) => s.sku === sku);
@@ -573,15 +1138,19 @@ app.post('/api/inventory/adjust', (req, res) => {
     return res.status(404).json({ error: `SKU ${sku} not found.` });
   }
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const qtyNum = Number(countedQuantity);
-  const type: 'SET_EXACT' | 'ADD' | 'SUBTRACT' = adjustmentType || 'SET_EXACT';
+  const timestampStr = nowStamp();
   let variance = 0;
 
-  // Find targeted batch or primary batch for the SKU
-  let targetBatch = batchNo ? batchesState.find((b) => b.batchNo === batchNo) : null;
-  if (!targetBatch) {
-    targetBatch = batchesState.find((b) => b.sku === sku) || null;
+  // Find the targeted batch (batch numbers are only unique per SKU).
+  let targetBatch: Batch | null = null;
+  if (batchNo) {
+    targetBatch = batchesState.find((b) => b.batchNo === batchNo && b.sku === sku) || null;
+  } else {
+    const skuBatches = batchesState.filter((b) => b.sku === sku);
+    if (skuBatches.length > 1) {
+      return res.status(400).json({ error: `SKU ${sku} has ${skuBatches.length} batches. Choose which batch you counted.` });
+    }
+    targetBatch = skuBatches[0] || null;
   }
 
   if (targetBatch) {
@@ -592,25 +1161,30 @@ app.post('/api/inventory/adjust', (req, res) => {
     } else if (type === 'ADD') {
       variance = qtyNum;
       targetBatch.quantityOnHand += qtyNum;
-    } else if (type === 'SUBTRACT') {
+    } else {
+      if (qtyNum > prevQty && !allowNegativeStock) {
+        return res.status(400).json({ error: `Cannot subtract ${qtyNum}; batch ${targetBatch.batchNo} only has ${prevQty} on hand.` });
+      }
       variance = -qtyNum;
-      targetBatch.quantityOnHand = Math.max(0, targetBatch.quantityOnHand - qtyNum);
+      targetBatch.quantityOnHand = prevQty - qtyNum;
     }
     targetBatch.quantityAvailable = Math.max(0, targetBatch.quantityOnHand - targetBatch.quantityAllocated);
     targetBatch.notes = notes ? `Stock Take Adj (${reasonCode || 'CYCLE_COUNT'}): ${notes}` : targetBatch.notes;
   } else {
+    if (type === 'SUBTRACT') {
+      return res.status(400).json({ error: `SKU ${sku} has no stock batch to subtract from.` });
+    }
     // If no batch exists, create an adjustment batch lot
-    const newLotId = `LOT-ADJ-${Date.now().toString().slice(-6)}`;
-    const newBatchNo = batchNo || `BATCH-ADJ-${Math.floor(1000 + Math.random() * 9000)}`;
-    const newQty = type === 'SUBTRACT' ? 0 : qtyNum;
+    const newBatchNo = batchNo || `BATCH-ADJ-${uid()}`;
+    const newQty = qtyNum;
     variance = newQty;
 
     targetBatch = {
-      id: newLotId,
+      id: `LOT-ADJ-${uid()}`,
       batchNo: newBatchNo,
       sku,
       itemName: skuObj.name,
-      manufactureDate: new Date().toISOString().split('T')[0],
+      manufactureDate: todayStr(),
       bestBeforeDate: new Date(Date.now() + 180 * 24 * 3600 * 1000).toISOString().split('T')[0],
       supplier: 'Stock Take Adjustment',
       locationId: locationId || 'BAY-ADJ-01',
@@ -625,33 +1199,25 @@ app.post('/api/inventory/adjust', (req, res) => {
     batchesState.unshift(targetBatch);
   }
 
-  // Update SKU aggregates if present
-  if (skuObj.exactQty !== undefined) {
-    skuObj.exactQty = Math.max(0, skuObj.exactQty + variance);
-  }
-  if (skuObj.currentQty !== undefined) {
-    skuObj.currentQty = Math.max(0, skuObj.currentQty + variance);
-  }
-
   // Record Stock Movement log
-  const movementLog: StockMovement = {
-    id: `LOG-${Date.now().toString().slice(-6)}`,
-    timestamp: timestampStr,
+  const movementLog = newMovement({
     type: 'ADJUSTMENT',
     sku,
     itemName: skuObj.name,
-    batchNo: targetBatch ? targetBatch.batchNo : 'N/A',
-    fromLocation: variance < 0 ? (targetBatch?.locationId || 'BAY-MAIN') : 'ADJUSTMENT_VIRTUAL',
-    toLocation: variance >= 0 ? (targetBatch?.locationId || 'BAY-MAIN') : 'SHRINKAGE_DISPOSAL',
+    batchNo: targetBatch.batchNo,
+    fromLocation: variance < 0 ? targetBatch.locationId || 'BAY-MAIN' : 'ADJUSTMENT_VIRTUAL',
+    toLocation: variance >= 0 ? targetBatch.locationId || 'BAY-MAIN' : 'SHRINKAGE_DISPOSAL',
     quantity: Math.abs(variance),
-    operator: operator || 'Stock Auditor',
+    operator: operator || (req as any).user?.name || 'Stock Auditor',
     referenceDoc: `ADJ-${reasonCode || 'CYCLE_COUNT'}-${Math.floor(1000 + Math.random() * 9000)}`
-  };
+  });
   stockMovementsState.unshift(movementLog);
+
+  syncInventoryAndMatrixState();
 
   // Record Audit Log Entry
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-AUDITOR-202',
     userName: operator || 'Stock Take Auditor',
@@ -685,7 +1251,7 @@ app.post('/api/inventory/import-skus', (req, res) => {
   let addedCount = 0;
   let updatedCount = 0;
   let skippedCount = 0;
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
 
   items.forEach((item) => {
     if (!item.sku || !item.name) return;
@@ -750,7 +1316,7 @@ app.post('/api/inventory/import-skus', (req, res) => {
 
   // Audit Log Entry
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-CSV-IMP',
     userName: operator || 'System Admin',
@@ -779,41 +1345,58 @@ app.post('/api/inventory/import-batches', (req, res) => {
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'No valid batch items provided in request array.' });
   }
+  if (!['OVERWRITE', 'SKIP_EXISTING', 'MERGE_STOCK'].includes(mode)) {
+    return res.status(400).json({ error: `Unknown import mode '${mode}'.` });
+  }
 
   const importedBatches: Batch[] = [];
+  const rejected: Array<{ row: number; batchNo?: string; reason: string }> = [];
   let addedCount = 0;
   let updatedCount = 0;
   let skippedCount = 0;
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
 
-  items.forEach((item) => {
-    if (!item.batchNo || !item.sku) return;
+  items.forEach((item, rowIdx) => {
+    const reject = (reason: string) => rejected.push({ row: rowIdx + 1, batchNo: item?.batchNo ? String(item.batchNo) : undefined, reason });
+    if (!item || !item.batchNo || !item.sku) return reject('Missing batch number or SKU.');
 
     const batchNoCode = String(item.batchNo).trim().toUpperCase();
     const skuCode = String(item.sku).trim().toUpperCase();
-    const existingIndex = batchesState.findIndex((b) => b.batchNo === batchNoCode);
+    // A batch number is only unique within one SKU.
+    const existingIndex = batchesState.findIndex((b) => b.batchNo === batchNoCode && b.sku === skuCode);
 
-    const qty = Number(item.quantityOnHand ?? item.quantity) || 0;
-    const cost = Number(item.unitCost) || 14.5;
-    const mfgDate = item.manufactureDate || new Date().toISOString().split('T')[0];
-    const bbdDate = item.bestBeforeDate || new Date(Date.now() + 180 * 24 * 3600 * 1000).toISOString().split('T')[0];
+    const rawQty = item.quantityOnHand ?? item.quantity ?? 0;
+    const qty = Number(rawQty);
+    if (!Number.isFinite(qty) || qty < 0) return reject(`Quantity '${rawQty}' is not a valid number.`);
+    if (item.bestBeforeDate && !isValidDate(item.bestBeforeDate)) return reject(`Best-before date '${item.bestBeforeDate}' is not valid (use YYYY-MM-DD).`);
+    if (item.manufactureDate && !isValidDate(item.manufactureDate)) return reject(`Manufacture date '${item.manufactureDate}' is not valid (use YYYY-MM-DD).`);
 
     const skuObj = skusState.find((s) => s.sku === skuCode);
+    if (!skuObj) return reject(`SKU ${skuCode} is not in the catalog. Import the SKU first.`);
+
+    const cost = Number(item.unitCost) || 14.5;
+    const mfgDate = item.manufactureDate || todayStr();
+    const bbdDate = item.bestBeforeDate || new Date(Date.now() + 180 * 24 * 3600 * 1000).toISOString().split('T')[0];
+
+    // The screens use QUARANTINED; accept the spelling QUARANTINE in files too.
+    const statusText = String(item.status || '').trim().toUpperCase();
+    const status: Batch['status'] =
+      statusText === 'QUARANTINE' || statusText === 'QUARANTINED' ? 'QUARANTINED' : statusText === 'RECALLED' ? 'RECALLED' : 'ACTIVE';
 
     const batchPayload: Batch = {
-      id: `LOT-IMP-${Date.now().toString().slice(-5)}-${Math.floor(Math.random() * 1000)}`,
+      id: `LOT-IMP-${uid()}`,
       batchNo: batchNoCode,
       sku: skuCode,
-      itemName: skuObj ? skuObj.name : String(item.itemName || skuCode).trim(),
+      itemName: skuObj.name,
       manufactureDate: mfgDate,
       bestBeforeDate: bbdDate,
       supplier: String(item.supplier || 'CSV Import Supplier').trim(),
       locationId: String(item.locationId || 'BAY-MAIN').trim(),
       quantityOnHand: qty,
       quantityAllocated: 0,
-      quantityAvailable: qty,
+      quantityAvailable: status === 'ACTIVE' ? qty : 0,
       unitCost: cost,
-      status: (item.status === 'QUARANTINE' ? 'QUARANTINE' : 'ACTIVE') as any,
+      status,
       receivedAt: timestampStr,
       notes: String(item.notes || 'Imported via CSV Batch Upload').trim()
     };
@@ -829,7 +1412,7 @@ app.post('/api/inventory/import-batches', (req, res) => {
         updatedCount++;
         importedBatches.push(existingB);
       } else {
-        batchesState[existingIndex] = { ...batchesState[existingIndex], ...batchPayload };
+        batchesState[existingIndex] = { ...batchesState[existingIndex], ...batchPayload, id: batchesState[existingIndex].id };
         updatedCount++;
         importedBatches.push(batchesState[existingIndex]);
       }
@@ -838,18 +1421,13 @@ app.post('/api/inventory/import-batches', (req, res) => {
       addedCount++;
       importedBatches.push(batchPayload);
     }
-
-    // Update SKU totals
-    if (skuObj && mode !== 'SKIP_EXISTING') {
-      skuObj.exactQty = (skuObj.exactQty || 0) + qty;
-      skuObj.currentQty = (skuObj.currentQty || 0) + qty;
-      skuObj.stockIn = (skuObj.stockIn || 0) + qty;
-    }
   });
+
+  syncInventoryAndMatrixState();
 
   // Audit Log Entry
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-CSV-IMP',
     userName: operator || 'System Admin',
@@ -857,8 +1435,8 @@ app.post('/api/inventory/import-batches', (req, res) => {
     actionCategory: 'INVENTORY',
     actionType: 'INBOUND_RECEIVED',
     targetEntity: 'Batch Lots CSV Bulk Import',
-    details: `Bulk Batch CSV Import (${mode} mode). Processed: ${items.length} (Added: ${addedCount}, Updated: ${updatedCount}, Skipped: ${skippedCount}).`,
-    severity: 'INFO'
+    details: `Bulk Batch CSV Import (${mode} mode). Processed: ${items.length} (Added: ${addedCount}, Updated: ${updatedCount}, Skipped: ${skippedCount}, Rejected: ${rejected.length}).`,
+    severity: rejected.length ? 'WARNING' : 'INFO'
   };
   auditLogsState.unshift(auditEntry);
 
@@ -867,6 +1445,8 @@ app.post('/api/inventory/import-batches', (req, res) => {
     addedCount,
     updatedCount,
     skippedCount,
+    rejectedCount: rejected.length,
+    rejected,
     totalProcessed: items.length,
     batches: importedBatches
   });
@@ -906,9 +1486,9 @@ app.post('/api/skus', (req, res) => {
   skusState.unshift(newSku);
 
   // Add audit log
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Inventory Master',
@@ -960,9 +1540,9 @@ app.put('/api/skus/:skuCode', (req, res) => {
   }
 
   // Add audit log
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Inventory Master',
@@ -1005,9 +1585,9 @@ app.put('/api/categories/rename', (req, res) => {
     }
   });
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Inventory Master',
@@ -1061,9 +1641,9 @@ app.post('/api/categories/delete', (req, res) => {
     deletedCategoriesState.push(catClean);
   }
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Inventory Master',
@@ -1120,9 +1700,9 @@ app.post('/api/locations', (req, res) => {
 
   locationsState.push(newLoc);
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1164,18 +1744,19 @@ app.delete('/api/locations/:id', (req, res) => {
     return res.status(404).json({ error: `Location ID ${decodedId} not found.` });
   }
 
-  // Safely reassign any batches in this location
-  batchesState.forEach((b) => {
-    if (b.locationId === locationsState[index].id || b.locationId === id) {
-      b.locationId = 'UNASSIGNED';
-    }
-  });
+  // Refuse to delete a bin that still holds stock (it would disappear from picking routes).
+  const stillInside = batchesState.filter((b) => b.locationId === locationsState[index].id && b.quantityOnHand > 0);
+  if (stillInside.length > 0) {
+    return res.status(400).json({
+      error: `Location ${locationsState[index].id} still holds stock (${stillInside.map((b) => `${b.batchNo} x${b.quantityOnHand}`).join(', ')}). Move or adjust it first.`
+    });
+  }
 
   const removed = locationsState.splice(index, 1)[0];
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1225,9 +1806,9 @@ app.post('/api/facilities', (req, res) => {
 
   facilitiesState.push(newFacility);
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1256,9 +1837,9 @@ app.put('/api/facilities/:id', (req, res) => {
     ...req.body
   };
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1285,9 +1866,9 @@ app.delete('/api/facilities/:id', (req, res) => {
 
   const deletedFacility = facilitiesState.splice(index, 1)[0];
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1340,9 +1921,9 @@ app.post('/api/zones', (req, res) => {
 
   zonesState.push(newZone);
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1371,9 +1952,9 @@ app.put('/api/zones/:code', (req, res) => {
     ...req.body
   };
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1407,9 +1988,9 @@ app.delete('/api/zones/:code', (req, res) => {
 
   const deletedZone = zonesState.splice(index, 1)[0];
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   auditLogsState.unshift({
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Administrator',
@@ -1434,8 +2015,8 @@ app.post('/api/purchase-orders', (req, res) => {
 
   const skuObj = skusState.find((s) => s.sku === sku);
   const matchedBatch = batchesState.find((b) => b.sku === sku);
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const newPoId = `PO-2026-${Math.floor(1000 + Math.random() * 9000)}`;
+  const timestampStr = nowStamp();
+  const newPoId = numId('PO-2026', purchaseOrdersState);
 
   const finalCost = Number(unitCost || matchedBatch?.unitCost || 12.50);
   const finalQty = Number(reorderQuantity);
@@ -1460,7 +2041,7 @@ app.post('/api/purchase-orders', (req, res) => {
 
   // Add an audit log entry for this purchase order creation
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: generatedBy || 'Warehouse Manager',
@@ -1489,9 +2070,9 @@ app.delete('/api/purchase-orders/:id', (req, res) => {
   const removedPo = purchaseOrdersState[existingIndex];
   purchaseOrdersState.splice(existingIndex, 1);
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Manager',
@@ -1512,9 +2093,9 @@ app.delete('/api/stock-movements', (req, res) => {
   const previousCount = stockMovementsState.length;
   stockMovementsState = [];
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Warehouse Manager',
@@ -1534,36 +2115,43 @@ app.delete('/api/stock-movements', (req, res) => {
 // USER PROFILE MANAGEMENT API ROUTES
 // ==========================================
 
-// GET /api/users - Fetch all team member profiles
+// GET /api/users - Fetch all team member profiles (never includes password data)
 app.get('/api/users', (req, res) => {
-  res.json(usersState);
+  res.json(usersState.map(publicUser));
 });
 
-// POST /api/users - Create a new team member profile
+// POST /api/users - Create a new team member profile (with a starting password)
 app.post('/api/users', (req, res) => {
-  const { name, email, role, department, shift, badgeCode } = req.body;
+  const { name, email, role, department, shift, badgeCode, password } = req.body;
 
   if (!name || !name.trim() || !email || !email.trim() || !role) {
     return res.status(400).json({ error: 'Name, email, and role are required fields.' });
   }
+  if (!['Admin', 'Warehouse Manager', 'Picker', 'Receiver'].includes(role)) {
+    return res.status(400).json({ error: `Unknown role '${role}'.` });
+  }
+  const problem = passwordProblem(password);
+  if (problem) return res.status(400).json({ error: problem });
+  if (usersState.some((u) => u.email.toLowerCase() === email.trim().toLowerCase())) {
+    return res.status(400).json({ error: `A user with e-mail ${email.trim()} already exists.` });
+  }
 
-  const newUserId = `USR-${Math.floor(100 + Math.random() * 900)}`;
-  const newUser: UserProfile = {
-    id: newUserId,
+  const newUser: StoredUser = {
+    id: numId('USR', usersState),
     name: name.trim(),
     email: email.trim(),
     role: role as UserRole,
     department: department?.trim() || 'Warehouse Operations',
     shift: shift?.trim() || 'First Shift (07:00 - 15:30)',
-    badgeCode: badgeCode?.trim() || `BDG-${Math.floor(1000 + Math.random() * 9000)}`
+    badgeCode: badgeCode?.trim() || `BDG-${Math.floor(1000 + Math.random() * 9000)}`,
+    passwordHash: hashPassword(password)
   };
 
   usersState.push(newUser);
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
-    timestamp: timestampStr,
+    id: `AUD-${uid()}`,
+    timestamp: nowStamp(),
     userId: 'USR-ADMIN-101',
     userName: 'System Administrator',
     userRole: 'Admin',
@@ -1575,69 +2163,95 @@ app.post('/api/users', (req, res) => {
   };
   auditLogsState.unshift(auditEntry);
 
-  res.json({ success: true, user: newUser, auditLog: auditEntry });
+  res.json({ success: true, user: publicUser(newUser), auditLog: auditEntry });
 });
 
-// PUT /api/users/:id - Update an existing team member profile
+// PUT /api/users/:id - Update an existing team member profile (optionally reset the password)
 app.put('/api/users/:id', (req, res) => {
   const { id } = req.params;
-  const { name, email, role, department, shift, badgeCode } = req.body;
+  const { name, email, role, department, shift, badgeCode, password } = req.body;
 
   const userIndex = usersState.findIndex((u) => u.id === id);
   if (userIndex === -1) {
     return res.status(404).json({ error: `User profile ${id} not found.` });
   }
+  // Without the "manage settings" right you may only edit your own details - not role or password.
+  const caller = (req as any).user as StoredUser;
+  if (!isAllowed(caller.role, ['settings:manage'], rolePermsState)) {
+    if (caller.id !== id) return res.status(403).json({ error: 'You can only edit your own profile.' });
+    if (role !== undefined && role !== caller.role) return res.status(403).json({ error: 'Only an administrator can change a role.' });
+    if (password) return res.status(403).json({ error: 'Use "Change password" to change your own password.' });
+  }
+  if (role !== undefined && !['Admin', 'Warehouse Manager', 'Picker', 'Receiver'].includes(role)) {
+    return res.status(400).json({ error: `Unknown role '${role}'.` });
+  }
+  if (password !== undefined && password !== '') {
+    const problem = passwordProblem(password);
+    if (problem) return res.status(400).json({ error: problem });
+  }
+  if (email !== undefined && usersState.some((u, i) => i !== userIndex && u.email.toLowerCase() === String(email).trim().toLowerCase())) {
+    return res.status(400).json({ error: `A user with e-mail ${String(email).trim()} already exists.` });
+  }
 
   const existingUser = usersState[userIndex];
-  const updatedUser: UserProfile = {
+  // Never remove the last administrator.
+  if (role !== undefined && role !== 'Admin' && existingUser.role === 'Admin' && usersState.filter((u) => u.role === 'Admin' && !u.disabled).length <= 1) {
+    return res.status(400).json({ error: 'There must be at least one Admin. Make someone else Admin first.' });
+  }
+
+  const updatedUser: StoredUser = {
     ...existingUser,
     name: name !== undefined ? name.trim() : existingUser.name,
     email: email !== undefined ? email.trim() : existingUser.email,
     role: role !== undefined ? (role as UserRole) : existingUser.role,
     department: department !== undefined ? department.trim() : existingUser.department,
     shift: shift !== undefined ? shift.trim() : existingUser.shift,
-    badgeCode: badgeCode !== undefined ? badgeCode.trim() : existingUser.badgeCode
+    badgeCode: badgeCode !== undefined ? badgeCode.trim() : existingUser.badgeCode,
+    passwordHash: password ? hashPassword(password) : existingUser.passwordHash
   };
 
   usersState[userIndex] = updatedUser;
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
-    timestamp: timestampStr,
+    id: `AUD-${uid()}`,
+    timestamp: nowStamp(),
     userId: 'USR-ADMIN-101',
     userName: 'System Administrator',
     userRole: 'Admin',
     actionCategory: 'ROLE_MANAGEMENT',
-    actionType: 'USER_PROFILE_UPDATED',
+    actionType: password ? 'USER_PASSWORD_RESET' : 'USER_PROFILE_UPDATED',
     targetEntity: updatedUser.name,
-    details: `Updated team member profile for ${updatedUser.name} (${updatedUser.role}, ${updatedUser.email}).`,
+    details: `Updated team member profile for ${updatedUser.name} (${updatedUser.role}, ${updatedUser.email}).${password ? ' Password was reset.' : ''}`,
     severity: 'INFO'
   };
   auditLogsState.unshift(auditEntry);
 
-  res.json({ success: true, user: updatedUser, auditLog: auditEntry });
+  res.json({ success: true, user: publicUser(updatedUser), auditLog: auditEntry });
 });
 
 // DELETE /api/users/:id - Delete a team member profile
 app.delete('/api/users/:id', (req, res) => {
   const { id } = req.params;
 
-  if (usersState.length <= 1) {
-    return res.status(400).json({ error: 'Cannot delete the only remaining user in the system.' });
-  }
-
   const targetUser = usersState.find((u) => u.id === id);
   if (!targetUser) {
     return res.status(404).json({ error: `User profile ${id} not found.` });
   }
+  if (usersState.length <= 1) {
+    return res.status(400).json({ error: 'Cannot delete the only remaining user in the system.' });
+  }
+  if (targetUser.role === 'Admin' && usersState.filter((u) => u.role === 'Admin' && !u.disabled).length <= 1) {
+    return res.status(400).json({ error: 'Cannot delete the last Admin.' });
+  }
+  if (targetUser.id === (req as any).user?.id) {
+    return res.status(400).json({ error: 'You cannot delete your own account while signed in.' });
+  }
 
   usersState = usersState.filter((u) => u.id !== id);
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
-    timestamp: timestampStr,
+    id: `AUD-${uid()}`,
+    timestamp: nowStamp(),
     userId: 'USR-ADMIN-101',
     userName: 'System Administrator',
     userRole: 'Admin',
@@ -1769,9 +2383,9 @@ const syncReservedStockState = syncInventoryAndMatrixState;
 app.post('/api/matrix/sync', (req, res) => {
   syncInventoryAndMatrixState();
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'System Admin',
@@ -1801,18 +2415,36 @@ app.post('/api/sales-orders', (req, res) => {
     return res.status(400).json({ error: 'Missing required sales order fields: customerName and items array' });
   }
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const soNumber = salesOrderNo || `SO-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-  const orderId = `ORD-${Math.floor(9000 + Math.random() * 1000)}`;
+  const timestampStr = nowStamp();
+  const soNumber = salesOrderNo || numId('SO-2026', ordersState, (o) => o.salesOrderNo);
+  const orderId = numId('ORD', ordersState);
 
   let totalOrderCtn = 0;
   let totalAllocatedCtn = 0;
 
+  for (const item of items) {
+    const q = Number(item?.orderQtyCtn || item?.requestedQty || 0);
+    if (!item?.sku || !Number.isFinite(q) || q <= 0) {
+      return res.status(400).json({ error: 'Every order line needs a SKU and a quantity greater than 0.' });
+    }
+    if (!skusState.some((s) => s.sku === item.sku)) {
+      return res.status(400).json({ error: `SKU ${item.sku} is not in the catalog.` });
+    }
+  }
+
+  // You cannot reserve stock you do not have: allocation is capped at what is free.
+  const freeLeft = new Map<string, number>();
+  const warnings: string[] = [];
+
   const orderItems = items.map((item: any, idx: number) => {
     const skuObj = skusState.find((s) => s.sku === item.sku);
     const orderQty = Number(item.orderQtyCtn || item.requestedQty || 0);
-    const allocQty = Number(item.allocateQty !== undefined ? item.allocateQty : orderQty);
-    
+    const wanted = Number(item.allocateQty !== undefined ? item.allocateQty : orderQty);
+    if (!freeLeft.has(item.sku)) freeLeft.set(item.sku, freeStockFor(item.sku, ''));
+    const allocQty = Math.max(0, Math.min(wanted, freeLeft.get(item.sku)!));
+    freeLeft.set(item.sku, freeLeft.get(item.sku)! - allocQty);
+    if (allocQty < wanted) warnings.push(`${item.sku}: only ${allocQty} of ${wanted} could be reserved (not enough free stock).`);
+
     totalOrderCtn += orderQty;
     totalAllocatedCtn += allocQty;
 
@@ -1860,7 +2492,7 @@ app.post('/api/sales-orders', (req, res) => {
 
   // Audit log
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Sales Operations Manager',
@@ -1876,6 +2508,7 @@ app.post('/api/sales-orders', (req, res) => {
   res.json({
     success: true,
     order: newSalesOrder,
+    warnings,
     skus: skusState,
     batches: batchesState,
     auditLog: auditEntry
@@ -1896,13 +2529,30 @@ app.put('/api/sales-orders/:id/allocation', (req, res) => {
   if (targetOrder.isLocked) {
     return res.status(400).json({ error: `Sales Order ${id} is locked and marked DONE. Unlock it first to modify allocations.` });
   }
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
 
   let totalOrderCtn = 0;
   let totalAllocatedCtn = 0;
   let totalFulfilledCtn = 0;
 
   if (Array.isArray(items)) {
+    for (const updateItem of items) {
+      for (const f of ['orderQtyCtn', 'requestedQty', 'allocateQty', 'fulfillmentQty']) {
+        if (updateItem[f] !== undefined && (!Number.isFinite(Number(updateItem[f])) || Number(updateItem[f]) < 0)) {
+          return res.status(400).json({ error: `${f} must be a number, 0 or more.` });
+        }
+      }
+    }
+    for (const updateItem of items) {
+      const line = targetOrder.items.find((i) => i.sku === updateItem.sku || i.id === updateItem.id);
+      if (line && updateItem.allocateQty !== undefined && Number(updateItem.allocateQty) > Number(line.allocateQty ?? 0)) {
+        const extra = Number(updateItem.allocateQty) - Number(line.allocateQty ?? 0);
+        const free = freeStockFor(line.sku, targetOrder.id) - Math.max(0, Number(line.allocateQty ?? 0) - itemFulfilled(line));
+        if (extra > Math.max(0, free)) {
+          return res.status(400).json({ error: `Cannot allocate ${updateItem.allocateQty} of ${line.sku}: only ${Math.max(0, Number(line.allocateQty ?? 0) + Math.max(0, free))} can be reserved from current stock.` });
+        }
+      }
+    }
     items.forEach((updateItem: any) => {
       const lineItem = targetOrder.items.find((i) => i.sku === updateItem.sku || i.id === updateItem.id);
       if (lineItem) {
@@ -1955,7 +2605,7 @@ app.put('/api/sales-orders/:id/allocation', (req, res) => {
 
   // Audit log
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Sales Operations Manager',
@@ -1977,7 +2627,7 @@ app.put('/api/sales-orders/:id/allocation', (req, res) => {
   });
 });
 
-// POST /api/sales-orders/:id/auto-allocate - Auto FEFO Allocation
+// POST /api/sales-orders/:id/auto-allocate - Auto FEFO Allocation (only what is really in stock)
 app.post('/api/sales-orders/:id/auto-allocate', (req, res) => {
   const { id } = req.params;
 
@@ -1985,38 +2635,54 @@ app.post('/api/sales-orders/:id/auto-allocate', (req, res) => {
   if (!targetOrder) {
     return res.status(404).json({ error: `Sales Order ${id} not found.` });
   }
+  if (targetOrder.isLocked) {
+    return res.status(400).json({ error: `Sales Order ${id} is locked. Unlock it first.` });
+  }
 
-  let totalAllocatedCtn = 0;
+  // Shippable stock per SKU, minus what other open orders have already reserved.
+  const freeBySku = new Map<string, number>();
+  const freeStock = (sku: string) => {
+    if (!freeBySku.has(sku)) {
+      const onHand = fefoBatches(sku).reduce((sum, b) => sum + b.quantityOnHand, 0);
+      freeBySku.set(sku, Math.max(0, onHand - reservedByOthers(sku, targetOrder.id)));
+    }
+    return freeBySku.get(sku)!;
+  };
 
+  const shortages: string[] = [];
   targetOrder.items.forEach((item) => {
-    const orderQty = item.orderQtyCtn ?? item.requestedQty ?? 0;
-    // Directly allocate 100% of the requested order quantity regardless of stock levels
-    item.allocateQty = orderQty;
-    totalAllocatedCtn += orderQty;
+    const fulfilled = itemFulfilled(item);
+    const stillNeeded = Math.max(0, itemRequested(item) - fulfilled);
+    const give = Math.min(stillNeeded, freeStock(item.sku));
+    freeBySku.set(item.sku, freeStock(item.sku) - give);
+    item.allocateQty = fulfilled + give;
+    if (give < stillNeeded) shortages.push(`${item.sku}: short by ${stillNeeded - give}`);
   });
 
-  targetOrder.totalAllocatedCtn = totalAllocatedCtn;
+  recalcOrderTotals(targetOrder);
+  targetOrder.fulfillmentStatus = shortages.length ? 'PARTIAL' : 'OUTSTANDING';
 
   // Re-sync reserved stock across system
   syncReservedStockState();
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Automated Allocation Engine',
     userRole: 'Admin',
     actionCategory: 'INVENTORY',
-    actionType: 'AUTO_ALLOCATE_SUCCESS',
+    actionType: shortages.length ? 'AUTO_ALLOCATE_PARTIAL' : 'AUTO_ALLOCATE_SUCCESS',
     targetEntity: targetOrder.salesOrderNo || targetOrder.id,
-    details: `Auto-allocated FEFO stock for Sales Order ${targetOrder.salesOrderNo || targetOrder.id}. Total allocated: ${totalAllocatedCtn} CTN.`,
-    severity: 'INFO'
+    details: `Auto-allocated FEFO stock for Sales Order ${targetOrder.salesOrderNo || targetOrder.id}. Total allocated: ${targetOrder.totalAllocatedCtn} of ${targetOrder.totalOrderCtn} CTN.${shortages.length ? ' Not enough stock: ' + shortages.join('; ') + '.' : ''}`,
+    severity: shortages.length ? 'WARNING' : 'INFO'
   };
   auditLogsState.unshift(auditEntry);
 
   res.json({
     success: true,
+    shortages,
     order: targetOrder,
     skus: skusState,
     batches: batchesState,
@@ -2042,9 +2708,9 @@ app.delete('/api/sales-orders/:id', (req, res) => {
   // Sync reserved stock state
   syncReservedStockState();
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const timestampStr = nowStamp();
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Sales Operations Manager',
@@ -2067,9 +2733,12 @@ app.delete('/api/sales-orders/:id', (req, res) => {
 });
 
 // POST /api/sales-orders/:id/lock - Lock or unlock a Sales Order
+//   Locking marks the order FULFILLED. Any quantity not yet picked is taken out of stock
+//   (earliest best-before first). If there is not enough stock the lock is refused, unless
+//   the caller sends { forceWithoutStock: true } to lock without touching stock.
 app.post('/api/sales-orders/:id/lock', (req, res) => {
   const { id } = req.params;
-  const { isLocked } = req.body;
+  const { isLocked, forceWithoutStock } = req.body;
 
   const targetOrder = ordersState.find((o) => o.id === id || o.salesOrderNo === id);
   if (!targetOrder) {
@@ -2077,43 +2746,108 @@ app.post('/api/sales-orders/:id/lock', (req, res) => {
   }
 
   const shouldLock = isLocked !== undefined ? Boolean(isLocked) : !targetOrder.isLocked;
-  targetOrder.isLocked = shouldLock;
+  const timestampStr = nowStamp();
+  const orderRef = targetOrder.salesOrderNo || targetOrder.id;
+  const deductions: Array<{ batch: Batch; qty: number; item: (typeof targetOrder.items)[number] }> = [];
 
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  if (shouldLock && !targetOrder.isLocked && !forceWithoutStock) {
+    // Work out the stock that still has to leave the warehouse, and check it exists.
+    const used = new Map<Batch, number>();
+    const missing: string[] = [];
+    for (const item of targetOrder.items) {
+      let need = Math.max(0, itemRequested(item) - itemFulfilled(item));
+      for (const b of fefoBatches(item.sku)) {
+        if (need <= 0) break;
+        const free = b.quantityOnHand - (used.get(b) || 0);
+        if (free <= 0) continue;
+        const take = Math.min(free, need);
+        used.set(b, (used.get(b) || 0) + take);
+        deductions.push({ batch: b, qty: take, item });
+        need -= take;
+      }
+      if (need > 0 && allowNegativeStock) {
+        // Negative stock allowed: the shortfall is taken from the last batch used, or the earliest usable batch.
+        const lastForItem = [...deductions].reverse().find((d) => d.item === item);
+        const target =
+          lastForItem?.batch ||
+          batchesState
+            .filter((b) => b.sku === item.sku && b.status === 'ACTIVE' && !isExpired(b.bestBeforeDate))
+            .sort((a, b) => new Date(a.bestBeforeDate).getTime() - new Date(b.bestBeforeDate).getTime())[0];
+        if (target) {
+          deductions.push({ batch: target, qty: need, item });
+          need = 0;
+        }
+      }
+      if (need > 0) missing.push(`${item.sku} (short by ${need})`);
+    }
+    if (missing.length) {
+      return res.status(400).json({
+        error: `Cannot lock ${orderRef}: not enough shippable stock for ${missing.join(', ')}. Receive or adjust stock first.`
+      });
+    }
+  }
+
+  targetOrder.isLocked = shouldLock;
 
   if (shouldLock) {
     targetOrder.status = 'DONE';
     targetOrder.fulfillmentStatus = 'FULFILLED';
     targetOrder.lockedAt = timestampStr;
-    // Mark items fulfilled if locked
-    targetOrder.items.forEach((item) => {
-      if ((item.fulfillmentQty || 0) < (item.orderQtyCtn || item.requestedQty || 0)) {
-        item.fulfillmentQty = item.orderQtyCtn || item.requestedQty || 0;
-        item.pickedQty = item.fulfillmentQty;
-        item.outstandingQty = 0;
-        item.isPicked = true;
-      }
+    targetOrder.lockedBy = (req as any).user?.name;
+
+    // Take the remaining quantity out of stock and log it.
+    deductions.forEach(({ batch, qty, item }) => {
+      batch.quantityOnHand -= qty;
+      batch.quantityAvailable = Math.max(0, batch.quantityOnHand - batch.quantityAllocated);
+      stockMovementsState.unshift(
+        newMovement({
+          type: 'DISPATCH',
+          sku: batch.sku,
+          itemName: batch.itemName,
+          batchNo: batch.batchNo,
+          fromLocation: batch.locationId,
+          toLocation: targetOrder.destinationZone,
+          quantity: qty,
+          operator: (req as any).user?.name || 'System',
+          referenceDoc: orderRef
+        })
+      );
+      item.fulfillmentQty = itemFulfilled(item) + qty;
     });
-    const totalOrderCtn = targetOrder.items.reduce((sum, i) => sum + (i.orderQtyCtn || i.requestedQty || 0), 0);
-    targetOrder.totalFulfilledCtn = totalOrderCtn;
+
+    // Mark every line fulfilled.
+    targetOrder.items.forEach((item) => {
+      const requested = itemRequested(item);
+      if (itemFulfilled(item) < requested) item.fulfillmentQty = requested; // only when forced without stock
+      item.pickedQty = itemFulfilled(item);
+      item.outstandingQty = 0;
+      item.isPicked = true;
+    });
+    recalcOrderTotals(targetOrder);
     targetOrder.totalOutstandingCtn = 0;
   }
 
   syncReservedStockState();
 
   const auditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
+    id: `AUD-${uid()}`,
     timestamp: timestampStr,
     userId: 'USR-ADMIN-101',
     userName: 'Sales Operations Manager',
     userRole: 'Admin',
     actionCategory: 'INVENTORY',
     actionType: shouldLock ? 'SALES_ORDER_LOCKED' : 'SALES_ORDER_UNLOCKED',
-    targetEntity: targetOrder.salesOrderNo || targetOrder.id,
+    targetEntity: orderRef,
     details: shouldLock
-      ? `Locked Sales Order ${targetOrder.salesOrderNo || targetOrder.id} as FULFILLED and DONE.`
-      : `Unlocked Sales Order ${targetOrder.salesOrderNo || targetOrder.id} for edits.`,
-    severity: 'INFO'
+      ? `Locked Sales Order ${orderRef} as FULFILLED and DONE.${
+          deductions.length
+            ? ' Stock taken out: ' + deductions.map((d) => `${d.batch.batchNo} x${d.qty}`).join(', ') + '.'
+            : forceWithoutStock
+            ? ' Locked WITHOUT changing stock (forced).'
+            : ''
+        }`
+      : `Unlocked Sales Order ${orderRef} for edits.`,
+    severity: shouldLock && forceWithoutStock ? 'WARNING' : 'INFO'
   };
   auditLogsState.unshift(auditEntry);
 
@@ -2129,65 +2863,128 @@ app.post('/api/sales-orders/:id/lock', (req, res) => {
 // POST /api/orders/optimize-route - Calculate optimized picking route
 app.post('/api/orders/optimize-route', (req, res) => {
   const { orderId } = req.body;
-  const order = ordersState.find((o) => o.id === orderId);
+  const order = ordersState.find((o) => o.id === orderId || o.salesOrderNo === orderId);
 
   if (!order) {
     return res.status(404).json({ error: `Order ${orderId} not found.` });
   }
+  if (order.status === 'COMPLETED' || order.status === 'DONE' || order.status === 'CANCELLED') {
+    return res.status(400).json({ error: `Order ${order.salesOrderNo || order.id} is ${order.status}; there is nothing left to pick.` });
+  }
 
   const route = calculateOptimizedPickRoute(order, batchesState, locationsState);
-  order.status = 'OPTIMIZED';
+  if (order.status === 'PENDING') order.status = 'OPTIMIZED';
 
   res.json({ order, route });
 });
 
-// POST /api/orders/complete-pick - Mark picking order completed and deduct batch quantities
+// POST /api/orders/complete-pick - Record what was picked and deduct it from the batches
+//   body: { orderId, pickedItems: [{ batchNo, qty, sku? }] }
+//   Safe to retry: a finished order cannot be picked twice, and nothing is changed unless
+//   every line in the request is valid.
 app.post('/api/orders/complete-pick', (req, res) => {
   const { orderId, pickedItems } = req.body;
 
-  const order = ordersState.find((o) => o.id === orderId);
+  const order = ordersState.find((o) => o.id === orderId || o.salesOrderNo === orderId);
   if (!order) {
     return res.status(404).json({ error: `Order ${orderId} not found.` });
   }
-
-  const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
-
-  // Process item deductions according to FEFO
-  if (Array.isArray(pickedItems)) {
-    pickedItems.forEach((picked) => {
-      const { batchNo, qty } = picked;
-      const targetBatch = batchesState.find((b) => b.batchNo === batchNo);
-
-      if (targetBatch) {
-        targetBatch.quantityOnHand = targetBatch.quantityOnHand - qty;
-        targetBatch.quantityAllocated = Math.max(0, targetBatch.quantityAllocated - qty);
-        targetBatch.quantityAvailable = targetBatch.quantityOnHand - targetBatch.quantityAllocated;
-
-        // Record stock movement
-        stockMovementsState.unshift({
-          id: `LOG-${Date.now().toString().slice(-6)}`,
-          timestamp: timestampStr,
-          type: 'PICKING',
-          sku: targetBatch.sku,
-          itemName: targetBatch.itemName,
-          batchNo: targetBatch.batchNo,
-          fromLocation: targetBatch.locationId,
-          toLocation: order.destinationZone,
-          quantity: qty,
-          operator: 'Floor Picker (Guided Route)',
-          referenceDoc: order.id
-        });
-      }
-    });
+  if (order.status === 'COMPLETED' || order.status === 'DONE' || order.isLocked) {
+    return res.status(400).json({ error: `Order ${order.salesOrderNo || order.id} is already ${order.status}. Nothing was picked twice.` });
+  }
+  if (order.status === 'CANCELLED') {
+    return res.status(400).json({ error: `Order ${order.salesOrderNo || order.id} is cancelled.` });
+  }
+  if (!Array.isArray(pickedItems) || pickedItems.length === 0) {
+    return res.status(400).json({ error: 'pickedItems is required (batchNo and qty for each pick).' });
   }
 
-  order.status = 'COMPLETED';
-  order.items.forEach((item) => {
-    item.isPicked = true;
-    item.pickedQty = item.requestedQty;
+  // ---- 1) validate everything first -------------------------------------------------
+  const orderSkus = new Set(order.items.map((i) => i.sku));
+  const resolved: Array<{ batch: Batch; qty: number }> = [];
+  const perBatchTotal = new Map<Batch, number>();
+  const perSkuTotal = new Map<string, number>();
+
+  for (const picked of pickedItems) {
+    const { batchNo, qty, sku } = picked || {};
+    if (!batchNo || !isPositive(qty)) {
+      return res.status(400).json({ error: 'Each pick needs a batchNo and a quantity greater than 0.' });
+    }
+    const q = Number(qty);
+    const candidates = batchesState.filter((b) => b.batchNo === batchNo && (sku ? b.sku === sku : orderSkus.has(b.sku)));
+    if (candidates.length === 0) {
+      return res.status(404).json({ error: `Batch ${batchNo} not found for this order's products.` });
+    }
+    if (candidates.length > 1) {
+      return res.status(400).json({ error: `Batch ${batchNo} matches more than one product. Include the sku with each pick.` });
+    }
+    const batch = candidates[0];
+    if (!orderSkus.has(batch.sku)) {
+      return res.status(400).json({ error: `Batch ${batchNo} (${batch.sku}) is not part of this order.` });
+    }
+    if (batch.status !== 'ACTIVE') {
+      return res.status(400).json({ error: `Batch ${batchNo} is ${batch.status} and cannot be picked.` });
+    }
+    const totalFromBatch = (perBatchTotal.get(batch) || 0) + q;
+    if (totalFromBatch > batch.quantityOnHand && !allowNegativeStock) {
+      return res.status(400).json({ error: `Batch ${batchNo} only has ${batch.quantityOnHand} on hand; ${totalFromBatch} was picked.` });
+    }
+    perBatchTotal.set(batch, totalFromBatch);
+    perSkuTotal.set(batch.sku, (perSkuTotal.get(batch.sku) || 0) + q);
+    resolved.push({ batch, qty: q });
+  }
+
+  for (const [sku, picked] of perSkuTotal) {
+    const outstanding = order.items
+      .filter((i) => i.sku === sku)
+      .reduce((sum, i) => sum + Math.max(0, itemRequested(i) - itemFulfilled(i)), 0);
+    if (picked > outstanding) {
+      return res.status(400).json({ error: `Picked ${picked} of ${sku} but the order only still needs ${outstanding}.` });
+    }
+  }
+
+  // ---- 2) apply ---------------------------------------------------------------------
+  resolved.forEach(({ batch, qty }) => {
+    batch.quantityOnHand -= qty;
+    batch.quantityAvailable = Math.max(0, batch.quantityOnHand - batch.quantityAllocated);
+    stockMovementsState.unshift(
+      newMovement({
+        type: 'PICKING',
+        sku: batch.sku,
+        itemName: batch.itemName,
+        batchNo: batch.batchNo,
+        fromLocation: batch.locationId,
+        toLocation: order.destinationZone,
+        quantity: qty,
+        operator: (req as any).user?.name || 'Floor Picker (Guided Route)',
+        referenceDoc: order.id
+      })
+    );
   });
 
-  res.json({ success: true, order });
+  // Credit each order line (a SKU can appear on several lines: fill them in order).
+  const creditLeft = new Map(perSkuTotal);
+  order.items.forEach((item) => {
+    let left = creditLeft.get(item.sku) || 0;
+    if (left <= 0) return;
+    const give = Math.min(left, Math.max(0, itemRequested(item) - itemFulfilled(item)));
+    item.fulfillmentQty = itemFulfilled(item) + give;
+    creditLeft.set(item.sku, left - give);
+  });
+  order.items.forEach((item) => {
+    item.pickedQty = itemFulfilled(item);
+    item.outstandingQty = Math.max(0, itemRequested(item) - itemFulfilled(item));
+    item.isPicked = item.outstandingQty === 0;
+  });
+  recalcOrderTotals(order);
+
+  const allDone = order.items.every((i) => (i.outstandingQty || 0) === 0);
+  order.status = allDone ? 'COMPLETED' : 'IN_PROGRESS';
+  order.fulfillmentStatus = allDone ? 'FULFILLED' : 'PARTIAL';
+
+  syncInventoryAndMatrixState();
+
+  res.json({ success: true, order, completed: allDone, outstandingCtn: order.totalOutstandingCtn });
 });
 
 // GET /api/audit-logs - Retrieve administrative audit logs
@@ -2197,24 +2994,25 @@ app.get('/api/audit-logs', (req, res) => {
 
 // POST /api/audit-logs - Create a new administrative audit log entry
 app.post('/api/audit-logs', (req, res) => {
-  const { userId, userName, userRole, actionCategory, actionType, targetEntity, details, severity, ipAddress } = req.body;
+  const { actionCategory, actionType, targetEntity, details, severity } = req.body;
+  const me = (req as any).user as StoredUser;
 
-  if (!userName || !actionCategory || !actionType || !details) {
+  if (!actionCategory || !actionType || !details) {
     return res.status(400).json({ error: 'Missing required audit log parameters.' });
   }
 
   const newAuditEntry: AuditLogEntry = {
-    id: `AUD-${Date.now().toString().slice(-6)}`,
-    timestamp: new Date().toISOString().replace('T', ' ').slice(0, 19),
-    userId: userId || 'USR-SYS',
-    userName: userName || 'System Administrator',
-    userRole: userRole || 'Admin',
+    id: `AUD-${uid()}`,
+    timestamp: nowStamp(),
+    userId: me.id,
+    userName: me.name,
+    userRole: me.role,
     actionCategory: actionCategory || 'SYSTEM',
     actionType,
     targetEntity: targetEntity || 'System',
     details,
     severity: severity || 'INFO',
-    ipAddress: ipAddress || '192.168.1.10'
+    ipAddress: String(req.ip || '').replace('::ffff:', '')
   };
 
   auditLogsState.unshift(newAuditEntry);
@@ -2225,38 +3023,47 @@ app.post('/api/audit-logs', (req, res) => {
 // MS SQL SERVER DATABASE EMULATOR & T-SQL ROUTE
 // ==========================================
 
-// GET /api/mssql/ping - Real-time MS SQL Server Connectivity Ping
-app.get('/api/mssql/ping', (req, res) => {
-  const serverHost = process.env.MSSQL_SERVER || 'localhost';
+// GET /api/mssql/ping - Real database connectivity check
+app.get('/api/mssql/ping', async (req, res) => {
+  const serverHost = process.env.MSSQL_SERVER || (process.env.WMS_STORE === 'memory' ? 'memory' : 'localhost');
   const port = process.env.MSSQL_PORT || '1433';
-  const database = process.env.MSSQL_DATABASE || 'ApexWMS_Production';
 
   if (mssqlSimulateOffline) {
     return res.status(503).json({
       connected: false,
       status: 'disconnected',
-      error: `Network Connection Timeout: Unable to reach MS SQL Server on ${serverHost}:${port}. The database engine is offline or unreachable.`,
-      databaseName: database,
+      error: `Simulated outage: pretending SQL Server on ${serverHost}:${port} is unreachable.`,
+      databaseName: process.env.MSSQL_DATABASE || 'ApexWMS',
       serverHost,
       port,
       timestamp: new Date().toISOString()
     });
   }
 
-  // Realistic latency response
-  const latencyMs = Math.floor(Math.random() * 8) + 4;
-
-  res.json({
-    connected: true,
-    status: 'connected',
-    databaseName: database,
-    serverVersion: 'Microsoft SQL Server 2025 (RTM-GDR) / 2022 Express',
-    serverHost,
-    port,
-    latencyMs,
-    activeConnections: 6,
-    timestamp: new Date().toISOString()
-  });
+  try {
+    const info = await store.ping();
+    res.json({
+      connected: true,
+      status: 'connected',
+      databaseName: info.databaseName,
+      serverVersion: info.serverVersion,
+      serverHost,
+      port,
+      latencyMs: info.latencyMs,
+      activeConnections: 0,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err: any) {
+    res.status(503).json({
+      connected: false,
+      status: 'disconnected',
+      error: `Cannot reach SQL Server on ${serverHost}:${port}: ${err?.message || err}`,
+      databaseName: process.env.MSSQL_DATABASE || 'ApexWMS',
+      serverHost,
+      port,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // POST /api/mssql/toggle-simulate-offline - Toggle offline simulation for QA testing
@@ -2333,7 +3140,7 @@ app.post('/api/mssql/query', (req, res) => {
         rows = rows.filter((r) => r.Status === 'QUARANTINED');
       } else if (/WHERE.*BestBeforeDate/i.test(normalizedSql)) {
         // Expiry filter
-        rows = rows.filter((r) => new Date(r.BestBeforeDate).getTime() < new Date('2026-09-01').getTime());
+        rows = rows.filter((r) => String(r.BestBeforeDate).slice(0, 10) < todayStr());
       }
     } else if (/SELECT.*FROM dbo\.Inventory/i.test(normalizedSql)) {
       columns = ['SKU', 'ItemName', 'Category', 'Unit', 'ReorderPoint', 'SafetyStock', 'WeightPerUnitKg', 'StorageZone'];
@@ -2486,7 +3293,9 @@ Batches Expiring in < 30 days: ${batchesState.filter(b => {
 Quarantined Lots: ${batchesState.filter(b => b.status === 'QUARANTINED').map(b => `${b.batchNo} (${b.itemName})`).join(', ') || 'None'}
 `;
 
-    const prompt = `Analyze this warehouse inventory state and provide 3 actionable, high-impact operational recommendations for:
+    const prompt = `${summaryText}
+
+Analyze this warehouse inventory state and provide 3 actionable, high-impact operational recommendations for:
 1. FEFO Expiry Risk & Spoilage Prevention
 2. Picking Route & Location Slotting Efficiency
 3. Lot Quality Control & Traceability Safeguards.
@@ -2512,7 +3321,19 @@ Keep the advice concise, professional, and formatted in clean bullet points with
 // ==========================================
 
 async function startServer() {
+  await initialize();
+
+  // Test-only switch (never enabled in production): make the next database write fail,
+  // to prove that a failed write leaves nothing half-saved.
+  if (process.env.WMS_TEST_HOOKS === '1' && store instanceof MemoryStore) {
+    app.post('/api/_test/fail-next-write', (req, res) => {
+      (store as MemoryStore).failNextApply = true;
+      res.json({ ok: true });
+    });
+  }
+
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
@@ -2535,17 +3356,30 @@ async function startServer() {
     );
     app.get('*', (req, res) => {
       res.setHeader('Cache-Control', 'no-cache, must-revalidate');
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(path.join(distPath, 'index.html'), (err) => {
+        if (err) res.status(404).send('ApexWMS service is running. Use the desktop app to connect.');
+      });
     });
   }
 
+  // Errors from the API handlers (must come after the routes).
+  app.use(((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('[WMS] Unhandled error:', err?.stack || err);
+    if (!res.headersSent) res.status(err?.status || 500).json({ error: err?.message || 'Server error' });
+  }) as any);
+
   const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ApexWMS Production Server running on http://0.0.0.0:${PORT}`);
+    console.log(`ApexWMS service running on port ${PORT}`);
   });
 
   const gracefulShutdown = (signal: string) => {
     console.log(`Received ${signal}. Initiating graceful shutdown...`);
-    server.close(() => {
+    server.close(async () => {
+      try {
+        await store.close();
+      } catch {
+        /* ignore */
+      }
       console.log('HTTP server closed. Process exiting.');
       process.exit(0);
     });
@@ -2559,4 +3393,7 @@ async function startServer() {
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[WMS] Could not start:', err?.message || err);
+  process.exit(1);
+});

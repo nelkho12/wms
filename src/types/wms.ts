@@ -182,7 +182,7 @@ export interface PickRoute {
 export interface StockMovement {
   id: string;
   timestamp: string;
-  type: 'INBOUND_RECEIVE' | 'PUTAWAY' | 'PICKING' | 'TRANSFER' | 'ADJUSTMENT' | 'QUARANTINE_HOLD' | 'DISPATCH';
+  type: 'INBOUND_RECEIVE' | 'PUTAWAY' | 'PICKING' | 'TRANSFER' | 'ADJUSTMENT' | 'QUARANTINE_HOLD' | 'QUARANTINE_RELEASE' | 'DISPATCH';
   sku: string;
   itemName: string;
   batchNo: string;

@@ -25,11 +25,17 @@ export function calculateOptimizedPickRoute(
   }> = [];
 
   for (const item of order.items) {
-    let remainingToPick = item.requestedQty;
+    // Only what is still left to pick (already-picked cartons are not walked to again).
+    const requested = item.orderQtyCtn ?? item.requestedQty ?? 0;
+    const alreadyPicked = item.fulfillmentQty ?? item.pickedQty ?? 0;
+    let remainingToPick = Math.max(0, requested - alreadyPicked);
+    const today = new Date().toISOString().slice(0, 10);
 
-    // Filter active batches for this SKU and sort by FEFO (Best Before Date ASC)
+    // Filter shippable batches for this SKU and sort by FEFO (Best Before Date ASC).
+    // Uses quantity physically on hand (the order's own reservation must not hide stock from it),
+    // and never sends the picker to quarantined or expired stock.
     const matchingBatches = batches
-      .filter((b) => b.sku === item.sku && b.status === 'ACTIVE' && b.quantityAvailable > 0)
+      .filter((b) => b.sku === item.sku && b.status === 'ACTIVE' && b.quantityOnHand > 0 && b.bestBeforeDate.slice(0, 10) >= today)
       .sort((a, b) => new Date(a.bestBeforeDate).getTime() - new Date(b.bestBeforeDate).getTime());
 
     for (const batch of matchingBatches) {
@@ -38,7 +44,7 @@ export function calculateOptimizedPickRoute(
       const loc = locationMap.get(batch.locationId);
       if (!loc) continue;
 
-      const qtyToPickFromBatch = Math.min(remainingToPick, batch.quantityAvailable);
+      const qtyToPickFromBatch = Math.min(remainingToPick, batch.quantityOnHand);
       remainingToPick -= qtyToPickFromBatch;
 
       const daysToExpiry = Math.ceil(
@@ -152,16 +158,17 @@ export function calculateOptimizedPickRoute(
   const totalMeters = Math.round(optimizedDistance * 3.2);
   const estimatedMins = Math.max(1, Math.round(totalMeters / 60) + routeNodes.length * 0.5);
 
+  // Real saving versus visiting the pick locations in list order (no made-up minimum).
   const savedPercent =
     unoptimizedDistance > 0
-      ? Math.min(65, Math.round(((unoptimizedDistance - optimizedDistance) / unoptimizedDistance) * 100))
-      : 30;
+      ? Math.max(0, Math.round(((unoptimizedDistance - optimizedDistance) / unoptimizedDistance) * 100))
+      : 0;
 
   return {
     orderId: order.id,
     totalDistanceMeters: totalMeters,
     estimatedTimeMinutes: Number(estimatedMins.toFixed(1)),
-    savedDistancePercent: Math.max(15, savedPercent),
+    savedDistancePercent: savedPercent,
     nodes: routeNodes,
     pathCoordinates
   };
