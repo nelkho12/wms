@@ -28,6 +28,7 @@ import { ProductSKU, Batch, Location, StockMovement, ZoneType, PurchaseOrder, St
 import { UserProfile } from '../types/roles';
 import { receiveInboundStock, fetchPurchaseOrders, createPurchaseOrder } from '../services/api';
 import { INITIAL_ZONES } from '../data/initialData';
+import { ZoneExpiryHeatmap } from './ZoneExpiryHeatmap';
 
 interface RealtimeDashboardProps {
   skus: ProductSKU[];
@@ -631,6 +632,15 @@ export const RealtimeDashboard: React.FC<RealtimeDashboardProps> = ({
         </div>
 
       </div>
+
+      {/* 2.5 BATCH EXPIRY HEATMAP ACROSS WAREHOUSE ZONES */}
+      <ZoneExpiryHeatmap
+        batches={batches}
+        locations={locations}
+        zones={zones}
+        skus={skus}
+        onSelectZone={(zoneCode) => setSelectedZone(zoneCode)}
+      />
 
       {/* 3. STOCK BY LOCATION - WAREHOUSE ZONES & OCCUPANCY */}
       <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-5">
