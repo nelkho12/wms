@@ -80,9 +80,12 @@ export const ZoneExpiryHeatmap: React.FC<ZoneExpiryHeatmapProps> = ({
   // Helper: calculate days to expiry relative to current date
   const getDaysToExpiry = (bestBeforeDate: string): number => {
     if (!bestBeforeDate) return 999;
-    const now = new Date();
-    const bbd = new Date(bestBeforeDate);
-    return Math.ceil((bbd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+    // Whole calendar days (today = 0), same rule as the service: stock is expired only after its date.
+    const [y, m, d] = bestBeforeDate.slice(0, 10).split('-').map(Number);
+    if (!y || !m || !d) return 999;
+    const t = new Date();
+    const today = Date.UTC(t.getFullYear(), t.getMonth(), t.getDate());
+    return Math.round((Date.UTC(y, m - 1, d) - today) / 86400000);
   };
 
   // Compile zone analytics and heatmap grid data
@@ -95,7 +98,7 @@ export const ZoneExpiryHeatmap: React.FC<ZoneExpiryHeatmapProps> = ({
       const zoneLocIds = new Set(zoneLocations.map((loc) => loc.id));
 
       // Find all batches stored in these locations
-      const zoneBatches = batches.filter((b) => zoneLocIds.has(b.locationId));
+      const zoneBatches = batches.filter((b) => zoneLocIds.has(b.locationId) && (b.quantityOnHand || 0) > 0);
 
       const criticalBatches: Batch[] = [];
       const warningBatches: Batch[] = [];
@@ -808,7 +811,7 @@ export const ZoneExpiryHeatmap: React.FC<ZoneExpiryHeatmapProps> = ({
                   ) : (
                     inspectedZoneBatches.map((batch) => {
                       const days = getDaysToExpiry(batch.bestBeforeDate);
-                      const isExpired = days <= 0;
+                      const isExpired = days < 0;
                       const isCritical = days > 0 && days <= 14;
                       const isWarning = days > 14 && days <= 30;
                       const isWatch = days > 30 && days <= 60;

@@ -375,11 +375,12 @@ test('AI Agent API: OpenAPI spec, tool declarations, API key auth, and tool exec
   const noAuthRes = await fetch(BASE + '/api/agent/v1/status');
   assert.equal(noAuthRes.status, 401);
 
-  // 3. Admin retrieves Agent API Key
-  const keyRes = await api('GET', '/api/agent/key');
+  // 3. Admin creates an Agent API key (shown once; the key itself is never readable afterwards)
+  const keyRes = await api('POST', '/api/agent/key/regenerate');
   assert.equal(keyRes.status, 200);
   const { apiKey } = keyRes.body;
   assert.ok(apiKey.startsWith('wms_'));
+  assert.equal((await api('GET', '/api/agent/key')).body.apiKey, '');
 
   // 4. Authenticated request using X-API-Key header
   const agentStatus = await fetch(BASE + '/api/agent/v1/status', {
@@ -407,3 +408,81 @@ test('AI Agent API: OpenAPI spec, tool declarations, API key auth, and tool exec
   assert.ok(execBody.data.items.length > 0);
 });
 
+
+// ------------------------------------------------------------------ security of the AI agent API
+test('SEC mssql console routes need a login and the right permission', async () => {
+  assert.equal((await api('GET', '/api/mssql/ping', undefined, '')).status, 401);
+  assert.equal((await api('POST', '/api/mssql/toggle-simulate-offline', undefined, '')).status, 401);
+  const made = await api('POST', '/api/users', { name: 'Sec Picker', email: 'sec@test.local', role: 'Picker', password: 'Picker12345' });
+  assert.equal(made.status, 200, JSON.stringify(made.body));
+  const pt = (await api('POST', '/api/auth/login', { email: 'sec@test.local', password: 'Picker12345' }, '')).body.token;
+  assert.equal((await api('POST', '/api/mssql/toggle-simulate-offline', undefined, pt)).status, 403);
+  assert.equal((await api('GET', '/api/agent/key', undefined, pt)).status, 403);
+  assert.equal((await api('POST', '/api/agent/key/regenerate', undefined, pt)).status, 403);
+});
+test('SEC the agent key only works on /api/agent/v1, and old keys stop working', async () => {
+  const k1 = (await api('POST', '/api/agent/key/regenerate')).body.apiKey;
+  const withKey = (key, method, path, body) =>
+    fetch(BASE + path, { method, headers: { 'Content-Type': 'application/json', 'X-API-Key': key }, body: body ? JSON.stringify(body) : undefined });
+  assert.equal((await withKey(k1, 'GET', '/api/agent/v1/status')).status, 200);
+  assert.equal((await withKey(k1, 'GET', '/api/users')).status, 403);
+  assert.equal((await withKey(k1, 'DELETE', '/api/stock-movements')).status, 403);
+  assert.equal((await withKey(k1, 'POST', '/api/users', { name: 'x', email: 'x@y.z', role: 'Admin', password: 'Hacked12345' })).status, 403);
+  assert.equal((await withKey(k1, 'GET', '/api/agent/key')).status, 403);
+  const k2 = (await api('POST', '/api/agent/key/regenerate')).body.apiKey;
+  assert.notEqual(k1, k2);
+  assert.equal((await withKey(k1, 'GET', '/api/agent/v1/status')).status, 401);
+  assert.equal((await withKey(k2, 'GET', '/api/agent/v1/status')).status, 200);
+  assert.equal((await withKey('wms_live_wrong', 'GET', '/api/agent/v1/status')).status, 401);
+});
+test('SEC agent stock tools validate input and respect batch + SKU', async () => {
+  const k = (await api('POST', '/api/agent/key/regenerate')).body.apiKey;
+  const run = async (tool, parameters) =>
+    (await fetch(BASE + '/api/agent/v1/execute', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': k }, body: JSON.stringify({ tool, parameters }) })).json();
+  const b = await activeBatch();
+  const loc = (await inv()).locations[0].id;
+  // junk is refused
+  assert.equal((await run('receive_stock', { sku: 'NO-SUCH-SKU', batchNo: 'ZZ1', quantity: 5, locationId: loc, bestBeforeDate: '2030-01-01' })).success, false);
+  assert.equal((await run('receive_stock', { sku: b.sku, batchNo: 'ZZ1', quantity: 5, locationId: 'NO-SUCH-BIN', bestBeforeDate: '2030-01-01' })).success, false);
+  assert.equal((await run('receive_stock', { sku: b.sku, batchNo: 'ZZ1', quantity: 5, locationId: loc, bestBeforeDate: 'not-a-date' })).success, false);
+  assert.equal((await run('receive_stock', { sku: b.sku, batchNo: 'ZZ1', quantity: -5, locationId: loc, bestBeforeDate: '2030-01-01' })).success, false);
+  assert.ok(!(await inv()).batches.some((x) => x.batchNo === 'ZZ1'));
+  // a good receive works, and a repeat adds to the same batch
+  const good = await run('receive_stock', { sku: b.sku, batchNo: 'ZZ1', quantity: 5, locationId: loc, bestBeforeDate: '2030-01-01' });
+  assert.equal(good.success, true, JSON.stringify(good));
+  assert.equal((await run('receive_stock', { sku: b.sku, batchNo: 'ZZ1', quantity: 2, locationId: loc, bestBeforeDate: '2030-01-01' })).data.totalQuantityOnHand, 7);
+  // same batch number under another product: ambiguity must be spelled out
+  const other = (await inv()).skus.find((s) => s.sku !== b.sku).sku;
+  assert.equal((await run('receive_stock', { sku: other, batchNo: 'ZZ1', quantity: 3, locationId: loc, bestBeforeDate: '2030-01-01' })).success, true);
+  const amb = await run('adjust_stock', { batchNo: 'ZZ1', newQuantity: 1, reason: 'test' });
+  assert.equal(amb.success, false);
+  assert.match(amb.error, /sku/i);
+  assert.equal((await batchOf('ZZ1', b.sku)).quantityOnHand, 7);
+  const ok = await run('adjust_stock', { batchNo: 'ZZ1', sku: other, newQuantity: 1, reason: 'test' });
+  assert.equal(ok.success, true);
+  assert.equal((await batchOf('ZZ1', other)).quantityOnHand, 1);
+  assert.equal((await batchOf('ZZ1', b.sku)).quantityOnHand, 7);
+  // partial moves are refused rather than silently moving everything
+  assert.equal((await run('move_stock', { batchNo: 'ZZ1', sku: b.sku, toLocationId: loc, quantity: 2 })).success, false);
+  // the "SQL" tool is honest about being a listing, and refuses anything but one SELECT
+  const q = await run('execute_sql_query', { query: 'SELECT * FROM Batches' });
+  assert.equal(q.data.simulated, true);
+  assert.equal((await run('execute_sql_query', { query: 'SELECT * FROM Users' })).success, false);
+  assert.equal((await run('execute_sql_query', { query: 'SELECT 1; DROP TABLE Batches' })).success, false);
+});
+
+test('agent status counts only lots that hold stock and uses calendar-day expiry', async () => {
+  const k = (await api('POST', '/api/agent/key/regenerate')).body.apiKey;
+  const run = async (tool, parameters) =>
+    (await fetch(BASE + '/api/agent/v1/execute', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': k }, body: JSON.stringify({ tool, parameters }) })).json();
+  const loc = (await inv()).locations[0].id;
+  const s = (await inv()).skus[0].sku;
+  const today = new Date();
+  const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const r = await run('receive_stock', { sku: s, batchNo: 'EXP-TODAY', quantity: 4, locationId: loc, bestBeforeDate: ymd(today) });
+  assert.equal(r.success, true, JSON.stringify(r));
+  const list = await run('get_expiring_batches', { withinDays: 3, limit: 200 });
+  const mine = list.data.batches.find((x) => x.batchNo === 'EXP-TODAY');
+  assert.equal(mine.daysUntilExpiry, 0);
+  assert.notEqual(mine.fefoPriority, 'EXPIRED'); // expires today = still shippable
+});

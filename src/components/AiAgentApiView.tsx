@@ -70,12 +70,12 @@ export const AiAgentApiView: React.FC<AiAgentApiViewProps> = ({ currentUser }) =
     setIsLoadingDetails(true);
     try {
       const details = await fetchAgentApiDetails();
-      setApiKey(details.apiKey);
+      setApiKey(details.apiKey || '');
       setBaseUrl(details.baseUrl || `${window.location.origin}/api/agent/v1`);
     } catch {
       // Fallback if not admin/manager
       setBaseUrl(`${window.location.origin}/api/agent/v1`);
-      setApiKey('wms_live_demo_agent_key');
+      setApiKey('');
     }
 
     try {
@@ -98,7 +98,10 @@ export const AiAgentApiView: React.FC<AiAgentApiViewProps> = ({ currentUser }) =
     loadData();
   }, []);
 
+  const shownKey = apiKey || 'YOUR_API_KEY';
+
   const handleCopyKey = () => {
+    if (!apiKey) return;
     navigator.clipboard.writeText(apiKey);
     setCopiedKey(true);
     setTimeout(() => setCopiedKey(false), 2000);
@@ -122,7 +125,8 @@ export const AiAgentApiView: React.FC<AiAgentApiViewProps> = ({ currentUser }) =
     try {
       const res = await regenerateAgentApiKey();
       setApiKey(res.apiKey);
-      alert('New AI Agent API Key generated successfully.');
+      setShowKey(true);
+      alert(res.message || 'New AI Agent API key created. Copy it now - it will not be shown again.');
     } catch (err: any) {
       alert(`Failed to regenerate API key: ${err.message}`);
     } finally {
@@ -262,7 +266,7 @@ export const AiAgentApiView: React.FC<AiAgentApiViewProps> = ({ currentUser }) =
 
   // Code snippets generator
   const getCurlSnippet = () => {
-    return `# 1. Check warehouse status\ncurl -X GET "${effectiveBaseUrl}/status" \\\n  -H "X-API-Key: ${apiKey}"\n\n# 2. Search inventory for a SKU\ncurl -X GET "${effectiveBaseUrl}/inventory?query=PAR" \\\n  -H "X-API-Key: ${apiKey}"\n\n# 3. Universal tool execution\ncurl -X POST "${effectiveBaseUrl}/execute" \\\n  -H "Content-Type: application/json" \\\n  -H "X-API-Key: ${apiKey}" \\\n  -d '{\n    "tool": "${selectedTool}",\n    "parameters": ${toolParamsJson.replace(/\n/g, '\n    ')}\n  }'`;
+    return `# 1. Check warehouse status\ncurl -X GET "${effectiveBaseUrl}/status" \\\n  -H "X-API-Key: ${shownKey}"\n\n# 2. Search inventory for a SKU\ncurl -X GET "${effectiveBaseUrl}/inventory?query=PAR" \\\n  -H "X-API-Key: ${shownKey}"\n\n# 3. Universal tool execution\ncurl -X POST "${effectiveBaseUrl}/execute" \\\n  -H "Content-Type: application/json" \\\n  -H "X-API-Key: ${shownKey}" \\\n  -d '{\n    "tool": "${selectedTool}",\n    "parameters": ${toolParamsJson.replace(/\n/g, '\n    ')}\n  }'`;
   };
 
   const getPythonSnippet = () => {
@@ -270,7 +274,7 @@ export const AiAgentApiView: React.FC<AiAgentApiViewProps> = ({ currentUser }) =
 
 BASE_URL = "${effectiveBaseUrl}"
 HEADERS = {
-    "X-API-Key": "${apiKey}",
+    "X-API-Key": "${shownKey}",
     "Content-Type": "application/json"
 }
 
@@ -289,7 +293,7 @@ print("Tool Execution Result:", response)`;
 
   const getTsSnippet = () => {
     return `const BASE_URL = '${effectiveBaseUrl}';
-const API_KEY = '${apiKey}';
+const API_KEY = '${shownKey}';
 
 // 1. Fetch expiring lots (FEFO compliance)
 async function checkExpiringBatches() {
@@ -339,7 +343,7 @@ async function handleToolCall(toolCall) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-API-Key": "${apiKey}"
+      "X-API-Key": "${shownKey}"
     },
     body: JSON.stringify({
       tool: toolCall.function.name,
@@ -445,11 +449,15 @@ async function handleToolCall(toolCall) {
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center justify-between">
               <span>Live Agent API Key</span>
-              <span className="text-emerald-400 font-normal">Autonomous Admin Scope</span>
+              <span className="text-emerald-400 font-normal">Agent API access only</span>
             </label>
             <div className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5">
               <span className="text-xs font-mono text-amber-300 flex-1 truncate">
-                {showKey ? apiKey : apiKey.replace(/.(?=.{4})/g, '•')}
+                {!apiKey
+                  ? 'Hidden for safety - create a new key to see one'
+                  : showKey
+                  ? apiKey
+                  : apiKey.replace(/.(?=.{4})/g, '•')}
               </span>
               <button
                 onClick={() => setShowKey(!showKey)}
