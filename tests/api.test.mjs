@@ -470,3 +470,19 @@ test('SEC agent stock tools validate input and respect batch + SKU', async () =>
   assert.equal((await run('execute_sql_query', { query: 'SELECT * FROM Users' })).success, false);
   assert.equal((await run('execute_sql_query', { query: 'SELECT 1; DROP TABLE Batches' })).success, false);
 });
+
+test('agent status counts only lots that hold stock and uses calendar-day expiry', async () => {
+  const k = (await api('POST', '/api/agent/key/regenerate')).body.apiKey;
+  const run = async (tool, parameters) =>
+    (await fetch(BASE + '/api/agent/v1/execute', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': k }, body: JSON.stringify({ tool, parameters }) })).json();
+  const loc = (await inv()).locations[0].id;
+  const s = (await inv()).skus[0].sku;
+  const today = new Date();
+  const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const r = await run('receive_stock', { sku: s, batchNo: 'EXP-TODAY', quantity: 4, locationId: loc, bestBeforeDate: ymd(today) });
+  assert.equal(r.success, true, JSON.stringify(r));
+  const list = await run('get_expiring_batches', { withinDays: 3, limit: 200 });
+  const mine = list.data.batches.find((x) => x.batchNo === 'EXP-TODAY');
+  assert.equal(mine.daysUntilExpiry, 0);
+  assert.notEqual(mine.fefoPriority, 'EXPIRED'); // expires today = still shippable
+});

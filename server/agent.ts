@@ -33,6 +33,14 @@ export interface AgentToolDeclaration {
   };
 }
 
+/** Whole calendar days until a best-before date (today = 0). Same rule as the service: expired only after its date. */
+function daysUntil(bbd: string): number {
+  const [y, m, d] = String(bbd || '').slice(0, 10).split('-').map(Number);
+  if (!y || !m || !d) return 99999;
+  const t = new Date();
+  return Math.round((Date.UTC(y, m - 1, d) - Date.UTC(t.getFullYear(), t.getMonth(), t.getDate())) / 86400000);
+}
+
 const isDateStr = (d: unknown): d is string =>
   typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && !isNaN(new Date(d).getTime());
 
@@ -240,10 +248,9 @@ export async function executeAgentTool(
 
   switch (toolName) {
     case 'get_warehouse_status': {
-      const now = Date.now();
       const expiringSoon = batches.filter((b) => {
-        const days = Math.ceil((new Date(b.bestBeforeDate).getTime() - now) / (1000 * 3600 * 24));
-        return days <= 30 && b.status === 'ACTIVE';
+        const days = daysUntil(b.bestBeforeDate);
+        return days <= 30 && b.status === 'ACTIVE' && b.quantityOnHand > 0;
       });
       const quarantined = batches.filter((b) => b.status === 'QUARANTINED');
       const totalUnits = batches.reduce((sum, b) => sum + (b.quantityOnHand || 0), 0);
@@ -315,10 +322,9 @@ export async function executeAgentTool(
       if (!sku) return { success: false, error: `SKU '${skuCode}' not found in catalog` };
 
       const itemBatches = batches.filter((b) => b.sku.toLowerCase() === sku.sku.toLowerCase());
-      const now = Date.now();
 
       const batchList = itemBatches.map((b) => {
-        const days = Math.ceil((new Date(b.bestBeforeDate).getTime() - now) / (1000 * 3600 * 24));
+        const days = daysUntil(b.bestBeforeDate);
         const loc = locations.find((l) => l.id === b.locationId);
         return {
           batchNo: b.batchNo,
@@ -355,12 +361,11 @@ export async function executeAgentTool(
     case 'get_expiring_batches': {
       const daysThreshold = Number(params.withinDays) || 30;
       const limit = Math.min(Number(params.limit) || 50, 200);
-      const now = Date.now();
 
       const expiring = batches
         .filter((b) => b.status === 'ACTIVE' && b.quantityOnHand > 0)
         .map((b) => {
-          const days = Math.ceil((new Date(b.bestBeforeDate).getTime() - now) / (1000 * 3600 * 24));
+          const days = daysUntil(b.bestBeforeDate);
           const loc = locations.find((l) => l.id === b.locationId);
           return {
             batchNo: b.batchNo,
@@ -371,7 +376,7 @@ export async function executeAgentTool(
             daysUntilExpiry: days,
             locationId: b.locationId,
             locationZone: loc?.zone || 'General',
-            fefoPriority: days <= 0 ? 'EXPIRED' : days <= 14 ? 'CRITICAL' : days <= 30 ? 'HIGH' : 'NORMAL'
+            fefoPriority: days < 0 ? 'EXPIRED' : days <= 14 ? 'CRITICAL' : days <= 30 ? 'HIGH' : 'NORMAL'
           };
         })
         .filter((b) => b.daysUntilExpiry <= daysThreshold)
