@@ -107,6 +107,7 @@ const RULES: Rule[] = [
   { method: 'POST', path: /^\/api\/auth\/(logout|change-password)$/, need: 'any' },
   { method: 'POST', path: /^\/api\/audit-logs$/, need: 'any' },
   { method: 'POST', path: /^\/api\/gemini\//, need: 'any' },
+  { method: '*', path: /^\/api\/agent\//, need: 'any' },
 
   { method: 'POST', path: /^\/api\/inventory\/receive$/, need: ['inbound:receive', 'inventory:write'] },
   { method: 'POST', path: /^\/api\/inventory\/quarantine$/, need: ['quarantine:manage'] },

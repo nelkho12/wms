@@ -176,9 +176,11 @@ export interface SqlServerConfig {
 }
 
 export function sqlConfigFromEnv(env: NodeJS.ProcessEnv): SqlServerConfig {
+  const rawPort = env.MSSQL_PORT ? Number(env.MSSQL_PORT) : NaN;
+  const port = Number.isFinite(rawPort) && rawPort > 0 ? rawPort : 1433;
   return {
     server: env.MSSQL_SERVER || 'localhost',
-    port: Number(env.MSSQL_PORT || 1433),
+    port,
     database: env.MSSQL_DATABASE || 'ApexWMS',
     user: env.MSSQL_USER || '',
     password: env.MSSQL_PASSWORD || '',
@@ -207,7 +209,7 @@ export class SqlServerStore implements Store {
       options,
       pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
       requestTimeout: 30000,
-      connectionTimeout: 15000
+      connectionTimeout: 8000
     };
     // With a named instance the port must be left out (SQL Browser resolves it).
     if (!this.cfg.instanceName) config.port = this.cfg.port;

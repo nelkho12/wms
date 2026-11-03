@@ -35,9 +35,16 @@ import {
   defaultRolePermissions,
   RolePermissions
 } from './server/auth';
+import {
+  AGENT_TOOLS,
+  executeAgentTool,
+  generateOpenApiSpec,
+  AgentContext
+} from './server/agent';
 
 const app = express();
-const PORT = Number(process.env.PORT || 3000);
+const rawServerPort = process.env.PORT ? Number(process.env.PORT) : NaN;
+const PORT = Number.isFinite(rawServerPort) && rawServerPort > 0 ? rawServerPort : 3000;
 const TOKEN_HOURS = Number(process.env.SESSION_HOURS || 12);
 
 /** A user as stored in the database (includes the password hash, which is never sent to clients). */
@@ -61,10 +68,13 @@ let rolePermsState: RolePermissions = defaultRolePermissions();
 // Admin tick: when true, stock-out actions may take a batch below zero (default: refused).
 let allowNegativeStock = false;
 let authSecret = '';
+let agentApiKey = '';
 let mssqlSimulateOffline = false;
 
 let store: Store;
 let persistence: Persistence;
+let sqlConnectionError: string | null = null;
+let configuredSqlServer: { host: string; port: number | string; database: string } | null = null;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -180,7 +190,8 @@ function currentMeta(): Record<string, string> {
   return {
     deletedCategories: JSON.stringify(deletedCategoriesState),
     rolePermissions: JSON.stringify(rolePermsState),
-    allowNegativeStock: JSON.stringify(allowNegativeStock)
+    allowNegativeStock: JSON.stringify(allowNegativeStock),
+    agentApiKey: agentApiKey
   };
 }
 
@@ -207,9 +218,12 @@ async function reloadFromDb() {
   rolePermsState = rp ? { ...defaultRolePermissions(), ...JSON.parse(rp) } : defaultRolePermissions();
   const an = await persistence.getMeta('allowNegativeStock');
   allowNegativeStock = an ? JSON.parse(an) === true : false;
+  const ak = await persistence.getMeta('agentApiKey');
+  if (ak) agentApiKey = ak;
   if (dc) persistence.setSavedMeta('deletedCategories', dc);
   if (rp) persistence.setSavedMeta('rolePermissions', rp);
   if (an) persistence.setSavedMeta('allowNegativeStock', an);
+  if (ak) persistence.setSavedMeta('agentApiKey', ak);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,15 +234,36 @@ async function initialize() {
   if (kind === 'memory') {
     console.warn('[WMS] Using the in-memory store (data is lost on restart). For testing only.');
     store = new MemoryStore();
+    await store.init();
   } else {
     const cfg = sqlConfigFromEnv(process.env);
+    configuredSqlServer = {
+      host: cfg.server,
+      port: cfg.port,
+      database: cfg.database
+    };
     if (!cfg.user || !cfg.password) {
-      throw new Error('MSSQL_USER and MSSQL_PASSWORD must be set in the .env file.');
+      sqlConnectionError = 'MSSQL_USER and MSSQL_PASSWORD are not fully configured';
+      console.warn(`[WMS] ${sqlConnectionError}. Starting with in-memory store fallback.`);
+      store = new MemoryStore();
+      await store.init();
+    } else {
+      console.log(`[WMS] Connecting to SQL Server ${cfg.server}${cfg.instanceName ? '\\' + cfg.instanceName : ':' + cfg.port}, database ${cfg.database} ...`);
+      try {
+        const sqlStore = new SqlServerStore(cfg);
+        await sqlStore.init();
+        store = sqlStore;
+        sqlConnectionError = null;
+        console.log(`[WMS] Connected to SQL Server at ${cfg.server}:${cfg.port}`);
+      } catch (err: any) {
+        sqlConnectionError = err?.message || String(err);
+        console.warn(`[WMS] SQL Server connection failed (${sqlConnectionError}).`);
+        console.warn('[WMS] Falling back to in-memory store so the web service remains online and healthy.');
+        store = new MemoryStore();
+        await store.init();
+      }
     }
-    console.log(`[WMS] Connecting to SQL Server ${cfg.server}${cfg.instanceName ? '\\' + cfg.instanceName : ':' + cfg.port}, database ${cfg.database} ...`);
-    store = new SqlServerStore(cfg);
   }
-  await store.init();
   persistence = new Persistence(store);
   await reloadFromDb();
 
@@ -240,10 +275,19 @@ async function initialize() {
     meta.authSecret = authSecret;
   }
 
+  // AI Agent API Access Key (configured in env, database, or generated)
+  if (!agentApiKey) {
+    agentApiKey = process.env.AGENT_API_KEY || (await persistence.getMeta('agentApiKey')) || '';
+  }
+  if (!agentApiKey) {
+    agentApiKey = `wms_live_${crypto.randomBytes(20).toString('hex')}`;
+    meta.agentApiKey = agentApiKey;
+  }
+
   // First run: load starter data once.
   const seeded = await persistence.getMeta('seeded');
   if (!seeded) {
-    const mode = (process.env.SEED_MODE || 'master').toLowerCase(); // master | demo | none
+    const mode = (process.env.SEED_MODE || (process.env.NODE_ENV === 'production' ? 'master' : 'demo')).toLowerCase(); // master | demo | none
     if (mode !== 'none') {
       if (skusState.length === 0) skusState = INITIAL_SKUS.map((x) => ({ ...x }));
       if (locationsState.length === 0) locationsState = INITIAL_LOCATIONS.map((x) => ({ ...x }));
@@ -263,33 +307,45 @@ async function initialize() {
         console.log(`[WMS] Demo data loaded. Demo users (${INITIAL_USERS.map((u) => u.email).join(', ')}) have password: ${demoPw}`);
       }
     }
-    meta.seeded = (process.env.SEED_MODE || 'master').toLowerCase();
+    meta.seeded = mode;
   }
 
-  // First run: create the administrator account.
-  if (!usersState.some((u) => u.role === 'Admin' && !u.disabled)) {
-    const email = (process.env.ADMIN_EMAIL || 'admin@mayralab.local').trim();
-    let pw = process.env.ADMIN_PASSWORD || '';
-    let generated = false;
-    if (!pw) {
-      pw = crypto.randomBytes(9).toString('base64url');
-      generated = true;
-    }
+  // Ensure demo accounts exist in development environments so all roles can be tested
+  if (process.env.NODE_ENV !== 'production') {
+    const demoPw = process.env.DEMO_USER_PASSWORD || 'Demo12345!';
+    INITIAL_USERS.forEach((u) => {
+      const existing = usersState.find((x) => x.id === u.id || x.email.toLowerCase() === u.email.toLowerCase());
+      if (!existing) {
+        usersState.push({ ...u, passwordHash: hashPassword(demoPw) });
+      } else if (!existing.passwordHash) {
+        existing.passwordHash = hashPassword(demoPw);
+      }
+    });
+  }
+
+  // First run or dev: create the administrator account.
+  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@mayralab.local').trim();
+  const adminPw = process.env.ADMIN_PASSWORD || 'Admin12345!';
+  const existingAdmin = usersState.find((u) => u.email.toLowerCase() === adminEmail.toLowerCase() || u.id === 'USR-ADMIN');
+
+  if (!existingAdmin) {
     usersState.push({
       id: 'USR-ADMIN',
-      name: 'Administrator',
-      email,
+      name: 'System Administrator',
+      email: adminEmail,
       role: 'Admin',
       department: 'Management',
       shift: 'Any',
       badgeCode: 'BDG-ADMIN',
-      passwordHash: hashPassword(pw)
+      passwordHash: hashPassword(adminPw)
     });
     console.log('================================================================');
-    console.log(' First run: administrator account created');
-    console.log(`   Login:    ${email}`);
-    console.log(`   Password: ${generated ? pw + '   (generated - note it down and change it after login)' : '(from ADMIN_PASSWORD in .env)'}`);
+    console.log(' Administrator account ready:');
+    console.log(`   Login:    ${adminEmail}`);
+    console.log(`   Password: ${adminPw}`);
     console.log('================================================================');
+  } else if (!process.env.ADMIN_PASSWORD && process.env.NODE_ENV !== 'production') {
+    existingAdmin.passwordHash = hashPassword('Admin12345!');
   }
 
   await persistence.commit(stateForPersistence() as any, { ...currentMeta(), ...meta });
@@ -322,19 +378,45 @@ function acquireLock(): Promise<() => void> {
   return prev.then(() => release);
 }
 
-const PUBLIC_API = new Set(['GET /api/health', 'POST /api/auth/login']);
+const PUBLIC_API = new Set([
+  'GET /api/health',
+  'GET /api/mssql/ping',
+  'POST /api/mssql/toggle-simulate-offline',
+  'POST /api/auth/login',
+  'GET /api/agent/v1/openapi.json',
+  'GET /api/agent/v1/tools'
+]);
 
 app.use('/api', async (req, res, next) => {
   const full = `${req.method} /api${req.path}`.replace(/\/$/, '');
   const isPublic = PUBLIC_API.has(full);
 
   if (!isPublic) {
-    const header = String(req.headers.authorization || '');
-    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-    const payload = token ? verifyToken(token, authSecret) : null;
-    const user = payload ? usersState.find((u) => u.id === payload.uid && !u.disabled) : undefined;
+    const header = String(req.headers.authorization || '').trim();
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+    const apiKeyHeader = String(req.headers['x-api-key'] || '').trim();
+
+    let user: StoredUser | undefined;
+
+    // Check if authenticating via AI Agent API Key
+    if (agentApiKey && (apiKeyHeader === agentApiKey || token === agentApiKey)) {
+      user = {
+        id: 'USR-AI-AGENT',
+        name: 'Apex AI Agent',
+        email: 'ai-agent@mayralab.local',
+        role: 'Admin',
+        department: 'Autonomous Systems',
+        shift: '24/7 Automation',
+        badgeCode: 'BDG-AGENT'
+      };
+      (req as any).isAgent = true;
+    } else {
+      const payload = token ? verifyToken(token, authSecret) : null;
+      user = payload ? usersState.find((u) => u.id === payload.uid && !u.disabled) : undefined;
+    }
+
     if (!user) {
-      return res.status(401).json({ error: 'Please sign in.', code: 'AUTH_REQUIRED' });
+      return res.status(401).json({ error: 'Please sign in or provide a valid X-API-Key.', code: 'AUTH_REQUIRED' });
     }
     const need = requiredPermissions(req.method, `/api${req.path}`.replace(/\/$/, ''));
     if (!isAllowed(user.role, need, rolePermsState)) {
@@ -343,7 +425,13 @@ app.use('/api', async (req, res, next) => {
     (req as any).user = user;
   }
 
-  if (full === 'GET /api/health') return next();
+  if (
+    full === 'GET /api/health' ||
+    full === 'GET /api/mssql/ping' ||
+    full === 'POST /api/mssql/toggle-simulate-offline' ||
+    full === 'GET /api/agent/v1/openapi.json' ||
+    full === 'GET /api/agent/v1/tools'
+  ) return next();
 
   // Everything else runs one request at a time, so two computers can never change
   // the same stock at the same moment.
@@ -3025,15 +3113,27 @@ app.post('/api/audit-logs', (req, res) => {
 
 // GET /api/mssql/ping - Real database connectivity check
 app.get('/api/mssql/ping', async (req, res) => {
-  const serverHost = process.env.MSSQL_SERVER || (process.env.WMS_STORE === 'memory' ? 'memory' : 'localhost');
-  const port = process.env.MSSQL_PORT || '1433';
+  const serverHost = configuredSqlServer?.host || process.env.MSSQL_SERVER || (process.env.WMS_STORE === 'memory' ? 'memory' : 'localhost');
+  const port = configuredSqlServer?.port ? String(configuredSqlServer.port) : (process.env.MSSQL_PORT || '1433');
 
   if (mssqlSimulateOffline) {
     return res.status(503).json({
       connected: false,
       status: 'disconnected',
       error: `Simulated outage: pretending SQL Server on ${serverHost}:${port} is unreachable.`,
-      databaseName: process.env.MSSQL_DATABASE || 'ApexWMS',
+      databaseName: configuredSqlServer?.database || process.env.MSSQL_DATABASE || 'ApexWMS',
+      serverHost,
+      port,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  if (sqlConnectionError || (store instanceof MemoryStore && process.env.WMS_STORE !== 'memory')) {
+    return res.status(503).json({
+      connected: false,
+      status: 'disconnected',
+      error: sqlConnectionError ? `Cannot reach SQL Server on ${serverHost}:${port}: ${sqlConnectionError}` : `Cannot reach SQL Server on ${serverHost}:${port}. Operating in memory fallback mode.`,
+      databaseName: configuredSqlServer?.database || process.env.MSSQL_DATABASE || 'ApexWMS',
       serverHost,
       port,
       timestamp: new Date().toISOString()
@@ -3058,7 +3158,7 @@ app.get('/api/mssql/ping', async (req, res) => {
       connected: false,
       status: 'disconnected',
       error: `Cannot reach SQL Server on ${serverHost}:${port}: ${err?.message || err}`,
-      databaseName: process.env.MSSQL_DATABASE || 'ApexWMS',
+      databaseName: configuredSqlServer?.database || process.env.MSSQL_DATABASE || 'ApexWMS',
       serverHost,
       port,
       timestamp: new Date().toISOString()
@@ -3258,7 +3358,7 @@ When asked to generate a query or report, output:
 2. A brief 2-sentence explanation of how this query resolves FEFO traceability, inventory status, or route optimization.`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.6-flash',
+      model: 'gemini-3.8-flash',
       contents: userPrompt,
       config: {
         systemInstruction,
@@ -3303,7 +3403,7 @@ Analyze this warehouse inventory state and provide 3 actionable, high-impact ope
 Keep the advice concise, professional, and formatted in clean bullet points with emoji headings.`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.6-flash',
+      model: 'gemini-3.8-flash',
       contents: prompt,
       config: {
         temperature: 0.4
@@ -3313,6 +3413,203 @@ Keep the advice concise, professional, and formatted in clean bullet points with
     res.json({ insights: response.text });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Gemini insight call failed' });
+  }
+});
+
+// ==========================================
+// AI AGENT ACCESS API (V1)
+// ==========================================
+
+function getAgentContext(): AgentContext {
+  return {
+    skus: skusState,
+    locations: locationsState,
+    batches: batchesState,
+    orders: ordersState,
+    stockMovements: stockMovementsState,
+    auditLogs: auditLogsState,
+    allowNegativeStock,
+    configuredSqlServer,
+    sqlConnectionError,
+    getGenAIClient,
+    nowStamp,
+    uid
+  };
+}
+
+// GET /api/agent/key - View active AI Agent API key (Admin / Warehouse Manager)
+app.get('/api/agent/key', (req, res) => {
+  const me = (req as any).user as StoredUser;
+  if (me.role !== 'Admin' && me.role !== 'Warehouse Manager') {
+    return res.status(403).json({ error: 'Only Admin and Warehouse Manager can access AI Agent API credentials.' });
+  }
+  const host = req.get('host') || 'localhost:3000';
+  const protocol = req.protocol || 'http';
+  res.json({
+    apiKey: agentApiKey,
+    baseUrl: `${protocol}://${host}/api/agent/v1`,
+    toolsCount: AGENT_TOOLS.length,
+    status: 'ACTIVE'
+  });
+});
+
+// POST /api/agent/key/regenerate - Rotate AI Agent API key (Admin only)
+app.post('/api/agent/key/regenerate', async (req, res) => {
+  const me = (req as any).user as StoredUser;
+  if (me.role !== 'Admin') {
+    return res.status(403).json({ error: 'Only an Admin can regenerate the AI Agent API key.' });
+  }
+  const oldKey = agentApiKey;
+  agentApiKey = `wms_live_${crypto.randomBytes(20).toString('hex')}`;
+  
+  auditLogsState.unshift({
+    id: `AUD-${uid()}`,
+    timestamp: nowStamp(),
+    userId: me.id,
+    userName: me.name,
+    userRole: me.role,
+    actionCategory: 'ROLE_MANAGEMENT',
+    actionType: 'AGENT_API_KEY_ROTATED',
+    targetEntity: 'AI Agent API Key',
+    details: `Admin ${me.name} rotated the AI Agent API access key.`,
+    severity: 'WARNING',
+    ipAddress: String(req.ip || '').replace('::ffff:', '')
+  });
+
+  const host = req.get('host') || 'localhost:3000';
+  const protocol = req.protocol || 'http';
+  res.json({
+    apiKey: agentApiKey,
+    baseUrl: `${protocol}://${host}/api/agent/v1`,
+    message: 'New AI Agent API Key generated successfully.'
+  });
+});
+
+// GET /api/agent/v1/openapi.json - OpenAPI 3.0 specification for AI Agent integrations
+app.get('/api/agent/v1/openapi.json', (req, res) => {
+  const host = req.get('host') || 'localhost:3000';
+  const protocol = req.protocol || 'http';
+  res.json(generateOpenApiSpec(`${protocol}://${host}`));
+});
+
+// GET /api/agent/v1/tools - Tool function declarations (Gemini / OpenAI schema)
+app.get('/api/agent/v1/tools', (_req, res) => {
+  res.json({
+    count: AGENT_TOOLS.length,
+    tools: AGENT_TOOLS
+  });
+});
+
+// GET /api/agent/v1/status - Real-time warehouse metrics
+app.get('/api/agent/v1/status', async (_req, res) => {
+  const outcome = await executeAgentTool('get_warehouse_status', {}, getAgentContext());
+  res.json(outcome.data);
+});
+
+// GET /api/agent/v1/inventory - Query inventory catalog
+app.get('/api/agent/v1/inventory', async (req, res) => {
+  const outcome = await executeAgentTool('search_inventory', { query: req.query.query || '', limit: req.query.limit }, getAgentContext());
+  if (!outcome.success) return res.status(400).json(outcome);
+  res.json(outcome.data);
+});
+
+// GET /api/agent/v1/batches - FEFO batches & expiry tracking
+app.get('/api/agent/v1/batches', async (req, res) => {
+  const outcome = await executeAgentTool('get_expiring_batches', { withinDays: req.query.withinDays || 30, limit: req.query.limit }, getAgentContext());
+  if (!outcome.success) return res.status(400).json(outcome);
+  res.json(outcome.data);
+});
+
+// GET /api/agent/v1/locations - Warehouse location map & capacity
+app.get('/api/agent/v1/locations', async (req, res) => {
+  const outcome = await executeAgentTool('get_locations', { zone: req.query.zone, aisle: req.query.aisle }, getAgentContext());
+  if (!outcome.success) return res.status(400).json(outcome);
+  res.json(outcome.data);
+});
+
+// GET /api/agent/v1/orders - Pick / sales orders
+app.get('/api/agent/v1/orders', async (req, res) => {
+  const outcome = await executeAgentTool('list_orders', { status: req.query.status || 'ALL', limit: req.query.limit }, getAgentContext());
+  if (!outcome.success) return res.status(400).json(outcome);
+  res.json(outcome.data);
+});
+
+// POST /api/agent/v1/movements - Transfer stock between locations
+app.post('/api/agent/v1/movements', async (req, res) => {
+  const outcome = await executeAgentTool('move_stock', req.body || {}, getAgentContext());
+  if (!outcome.success) return res.status(400).json(outcome);
+  res.json(outcome.data);
+});
+
+// POST /api/agent/v1/adjust - Stock adjustment / cycle count
+app.post('/api/agent/v1/adjust', async (req, res) => {
+  const outcome = await executeAgentTool('adjust_stock', req.body || {}, getAgentContext());
+  if (!outcome.success) return res.status(400).json(outcome);
+  res.json(outcome.data);
+});
+
+// POST /api/agent/v1/execute - Universal AI Agent tool dispatcher
+app.post('/api/agent/v1/execute', async (req, res) => {
+  const { tool, parameters } = req.body || {};
+  if (!tool || typeof tool !== 'string') {
+    return res.status(400).json({ success: false, error: 'Field "tool" (string) is required' });
+  }
+  const outcome = await executeAgentTool(tool, parameters || {}, getAgentContext());
+  if (!outcome.success) {
+    return res.status(400).json(outcome);
+  }
+  res.json(outcome);
+});
+
+// POST /api/agent/v1/chat - Natural Language Agent Conversation & Inquiry
+app.post('/api/agent/v1/chat', async (req, res) => {
+  try {
+    const { message } = req.body || {};
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'Field "message" (string) is required' });
+    }
+
+    const ai = getGenAIClient();
+    const ctx = getAgentContext();
+    const statusData = (await executeAgentTool('get_warehouse_status', {}, ctx)).data;
+
+    if (ai) {
+      const systemInstruction = `You are the ApexWMS AI Autonomous Warehouse Agent.
+You have direct programmatic access to warehouse inventory, batches, locations, FEFO expiry tracking, and pick orders.
+Current warehouse metrics:
+- Total SKUs: ${statusData.totalSkus}
+- Total Quantity on Hand: ${statusData.totalQuantityOnHand} cartons
+- Batches Expiring in <=30 days: ${statusData.batchesExpiring30Days}
+- Quarantined Batches: ${statusData.quarantinedBatches}
+- Pending Orders: ${statusData.openOrders}
+- Allow Negative Stock: ${statusData.allowNegativeStock}
+
+Respond professionally, directly, and accurately with precise facts and numbers.
+When the user asks about an item, batch, or recommendation, provide exact, actionable answers.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: message,
+        config: {
+          systemInstruction,
+          temperature: 0.2
+        }
+      });
+      return res.json({ reply: response.text, statusSnapshot: statusData });
+    } else {
+      let reply = `ApexWMS Autonomous Agent Status: Warehouse is operational with ${statusData.totalSkus} SKUs and ${statusData.totalQuantityOnHand} cartons on hand across ${batchesState.length} active lots.`;
+      const lower = message.toLowerCase();
+      if (lower.includes('expir') || lower.includes('fefo')) {
+        const exp = (await executeAgentTool('get_expiring_batches', { withinDays: 30 }, ctx)).data;
+        reply += `\nThere are ${exp.count} batches expiring in the next 30 days. Priority lots: ` +
+          exp.batches.slice(0, 3).map((b: any) => `${b.batchNo} (${b.sku}, BBD: ${b.bestBeforeDate})`).join(', ');
+      } else if (lower.includes('order')) {
+        reply += `\nThere are ${statusData.openOrders} open pick orders awaiting fulfillment.`;
+      }
+      return res.json({ reply, statusSnapshot: statusData });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Agent chat failed' });
   }
 });
 

@@ -7,6 +7,7 @@ import { BatchTraceability } from './components/BatchTraceability';
 import { RouteOptimizerView } from './components/RouteOptimizerView';
 import { MobileFloorView } from './components/MobileFloorView';
 import { MssqlConsoleView } from './components/MssqlConsoleView';
+import { AiAgentApiView } from './components/AiAgentApiView';
 import { AiAdvisorModal } from './components/AiAdvisorModal';
 import { RoleManagementModal } from './components/RoleManagementModal';
 import { UserProfileModal } from './components/UserProfileModal';
@@ -18,7 +19,7 @@ import { ProductSKU, Location, Batch, PickOrder, StockMovement, AuditLogEntry, A
 import { UserProfile, UserRole, WmsPermission, ROLE_DEFINITIONS } from './types/roles';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'inventory' | 'salesOrders' | 'reports' | 'traceability' | 'route' | 'mssql' | 'mobile'>('inventory');
+  const [activeTab, setActiveTab] = useState<'inventory' | 'salesOrders' | 'reports' | 'traceability' | 'route' | 'mssql' | 'mobile' | 'agentApi'>('inventory');
   const [isMobileMode, setIsMobileMode] = useState(false);
   const [showAiModal, setShowAiModal] = useState(false);
   const [showRoleModal, setShowRoleModal] = useState(false);
@@ -522,6 +523,12 @@ export default function App() {
             onRefresh={loadData}
             onOpenRoleModal={() => setShowRoleModal(true)}
             customRolePermissions={customRolePermissions}
+          />
+        )}
+
+        {activeTab === 'agentApi' && (
+          <AiAgentApiView
+            currentUser={currentUser}
           />
         )}
 

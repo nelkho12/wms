@@ -167,11 +167,82 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onLogin, prefill
             <span>{isLoading ? 'Signing in...' : 'Sign In'}</span>
           </button>
 
+          {/* Quick-fill Demo & Admin Credentials */}
+          <div className="pt-2 border-t border-slate-100">
+            <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center justify-between">
+              <span>Quick Login Accounts</span>
+              <span className="text-[10px] text-indigo-600 font-bold lowercase">Click to pre-fill</span>
+            </p>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setEmail('admin@mayralab.local');
+                  setPassword('Admin12345!');
+                }}
+                className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 border border-rose-200/70 rounded-lg text-left transition-colors cursor-pointer"
+              >
+                <div className="text-[11px] font-bold text-rose-900 truncate">System Admin</div>
+                <div className="text-[9px] text-rose-700/80 font-mono">admin@mayralab.local</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setEmail('s.connor@apexwms.io');
+                  setPassword('Demo12345!');
+                }}
+                className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200/70 rounded-lg text-left transition-colors cursor-pointer"
+              >
+                <div className="text-[11px] font-bold text-indigo-900 truncate">Sarah Connor (Admin)</div>
+                <div className="text-[9px] text-indigo-700/80 font-mono">s.connor@apexwms.io</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setEmail('m.vance@apexwms.io');
+                  setPassword('Demo12345!');
+                }}
+                className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 border border-blue-200/70 rounded-lg text-left transition-colors cursor-pointer"
+              >
+                <div className="text-[11px] font-bold text-blue-900 truncate">Marcus (Manager)</div>
+                <div className="text-[9px] text-blue-700/80 font-mono">m.vance@apexwms.io</div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setEmail('d.miller@apexwms.io');
+                  setPassword('Demo12345!');
+                }}
+                className="px-2.5 py-1.5 bg-amber-50 hover:bg-amber-100 border border-amber-200/70 rounded-lg text-left transition-colors cursor-pointer"
+              >
+                <div className="text-[11px] font-bold text-amber-900 truncate">Dave Miller (Picker)</div>
+                <div className="text-[9px] text-amber-700/80 font-mono">d.miller@apexwms.io</div>
+              </button>
+            </div>
+
+            <div className="mt-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setEmail('e.rostova@apexwms.io');
+                  setPassword('Demo12345!');
+                }}
+                className="w-full px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200/70 rounded-lg text-left transition-colors cursor-pointer"
+              >
+                <div className="text-[11px] font-bold text-emerald-900 truncate">Elena Rostova (Receiver)</div>
+                <div className="text-[9px] text-emerald-700/80 font-mono">e.rostova@apexwms.io • Demo12345!</div>
+              </button>
+            </div>
+          </div>
+
           {!askAddress && !showServer && (
             <button
               type="button"
               onClick={() => setShowServer(true)}
-              className="w-full text-[11px] text-slate-500 hover:text-slate-700 flex items-center justify-center cursor-pointer"
+              className="w-full text-[11px] text-slate-500 hover:text-slate-700 flex items-center justify-center cursor-pointer pt-1"
             >
               <Settings2 className="w-3 h-3 mr-1" /> Use a different service address
             </button>

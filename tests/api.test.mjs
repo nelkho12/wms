@@ -355,3 +355,55 @@ test('requests that fail validation leave no half-finished changes', async () =>
   assert.equal(r.status, 400);
   assert.equal((await batchOf(b.batchNo, sku)).quantityOnHand, before);
 });
+
+// ------------------------------------------------------------------ AI Agent API access
+test('AI Agent API: OpenAPI spec, tool declarations, API key auth, and tool execution', async () => {
+  // 1. OpenAPI and tools are public
+  const openapi = await fetch(BASE + '/api/agent/v1/openapi.json');
+  assert.equal(openapi.status, 200);
+  const openapiJson = await openapi.json();
+  assert.equal(openapiJson.openapi, '3.0.3');
+  assert.ok(openapiJson.paths['/status']);
+
+  const toolsRes = await fetch(BASE + '/api/agent/v1/tools');
+  assert.equal(toolsRes.status, 200);
+  const toolsJson = await toolsRes.json();
+  assert.ok(toolsJson.count >= 10);
+  assert.ok(toolsJson.tools.some((t) => t.name === 'get_warehouse_status'));
+
+  // 2. Unauthenticated status request fails
+  const noAuthRes = await fetch(BASE + '/api/agent/v1/status');
+  assert.equal(noAuthRes.status, 401);
+
+  // 3. Admin retrieves Agent API Key
+  const keyRes = await api('GET', '/api/agent/key');
+  assert.equal(keyRes.status, 200);
+  const { apiKey } = keyRes.body;
+  assert.ok(apiKey.startsWith('wms_'));
+
+  // 4. Authenticated request using X-API-Key header
+  const agentStatus = await fetch(BASE + '/api/agent/v1/status', {
+    headers: { 'X-API-Key': apiKey }
+  });
+  assert.equal(agentStatus.status, 200);
+  const statusBody = await agentStatus.json();
+  assert.ok(statusBody.totalSkus > 0);
+
+  // 5. Tool execution via /api/agent/v1/execute
+  const execRes = await fetch(BASE + '/api/agent/v1/execute', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': apiKey
+    },
+    body: JSON.stringify({
+      tool: 'search_inventory',
+      parameters: { query: sku }
+    })
+  });
+  assert.equal(execRes.status, 200);
+  const execBody = await execRes.json();
+  assert.equal(execBody.success, true);
+  assert.ok(execBody.data.items.length > 0);
+});
+

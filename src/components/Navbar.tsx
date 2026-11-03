@@ -26,14 +26,15 @@ import {
   AlertCircle,
   Activity,
   Server,
-  ExternalLink
+  ExternalLink,
+  Bot
 } from 'lucide-react';
 import { UserProfile, UserRole, WmsPermission, hasPermission } from '../types/roles';
 import { pingMssqlBackend, toggleSimulateMssqlOffline, MssqlPingStatus } from '../services/api';
 
 interface NavbarProps {
-  activeTab: 'inventory' | 'salesOrders' | 'reports' | 'traceability' | 'route' | 'mssql' | 'mobile';
-  setActiveTab: (tab: 'inventory' | 'salesOrders' | 'reports' | 'traceability' | 'route' | 'mssql' | 'mobile') => void;
+  activeTab: 'inventory' | 'salesOrders' | 'reports' | 'traceability' | 'route' | 'mssql' | 'mobile' | 'agentApi';
+  setActiveTab: (tab: 'inventory' | 'salesOrders' | 'reports' | 'traceability' | 'route' | 'mssql' | 'mobile' | 'agentApi') => void;
   isMobileMode: boolean;
   setIsMobileMode: (val: boolean) => void;
   onOpenAiInsights: () => void;
@@ -263,6 +264,21 @@ export const Navbar: React.FC<NavbarProps> = ({
                 )}
               </span>
             </button>
+
+            <button
+              onClick={() => setActiveTab('agentApi')}
+              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer whitespace-nowrap ${
+                activeTab === 'agentApi'
+                  ? 'bg-white text-purple-700 shadow-xs border border-slate-200/80 font-bold'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
+              }`}
+            >
+              <Bot className="w-4 h-4 shrink-0 text-purple-600" />
+              <span>AI Agent API</span>
+              <span className="px-1.5 py-0.2 rounded-full text-[9px] font-bold bg-purple-100 text-purple-700 border border-purple-200">
+                v1
+              </span>
+            </button>
           </nav>
 
           {/* Right Action Controls */}
@@ -332,6 +348,17 @@ export const Navbar: React.FC<NavbarProps> = ({
                       >
                         <ShieldCheck className="w-4 h-4 text-blue-600" />
                         <span>Switch Account / RBAC Roles</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setShowUserDropdown(false);
+                          setActiveTab('agentApi');
+                        }}
+                        className="w-full text-left px-4 py-2 hover:bg-purple-50 text-purple-800 font-semibold flex items-center space-x-2 transition-colors cursor-pointer"
+                      >
+                        <Bot className="w-4 h-4 text-purple-600" />
+                        <span>AI Agent API & Tools</span>
                       </button>
                     </div>
 

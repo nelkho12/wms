@@ -869,3 +869,68 @@ export async function saveRolePermissions(map: RolePermissionMap): Promise<RoleP
   if (!res.ok) throw new Error(await errorText(res, 'Could not save role permissions.'));
   return res.json();
 }
+
+// ---------------------------------------------------------------------------
+// AI AGENT ACCESS API HELPERS
+// ---------------------------------------------------------------------------
+
+export interface AgentApiDetails {
+  apiKey: string;
+  baseUrl: string;
+  toolsCount: number;
+  status: string;
+}
+
+export interface AgentToolItem {
+  name: string;
+  description: string;
+  parameters: {
+    type: string;
+    properties: Record<string, {
+      type: string;
+      description: string;
+      enum?: string[];
+      items?: { type: string };
+    }>;
+    required?: string[];
+  };
+}
+
+export async function fetchAgentApiDetails(): Promise<AgentApiDetails> {
+  const res = await apiFetch('/api/agent/key');
+  if (!res.ok) throw new Error(await errorText(res, 'Could not retrieve Agent API credentials.'));
+  return res.json();
+}
+
+export async function regenerateAgentApiKey(): Promise<{ apiKey: string; baseUrl: string; message: string }> {
+  const res = await apiFetch('/api/agent/key/regenerate', {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error(await errorText(res, 'Could not regenerate Agent API key.'));
+  return res.json();
+}
+
+export async function fetchAgentTools(): Promise<{ count: number; tools: AgentToolItem[] }> {
+  const res = await apiFetch('/api/agent/v1/tools');
+  if (!res.ok) throw new Error(await errorText(res, 'Could not load Agent tools catalog.'));
+  return res.json();
+}
+
+export async function executeAgentToolCall(tool: string, parameters: Record<string, any> = {}): Promise<{ success: boolean; data?: any; error?: string }> {
+  const res = await apiFetch('/api/agent/v1/execute', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tool, parameters })
+  });
+  return res.json();
+}
+
+export async function sendAgentChatMessage(message: string): Promise<{ reply: string; statusSnapshot: any }> {
+  const res = await apiFetch('/api/agent/v1/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message })
+  });
+  if (!res.ok) throw new Error(await errorText(res, 'Agent query failed.'));
+  return res.json();
+}
