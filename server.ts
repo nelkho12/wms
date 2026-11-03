@@ -68,7 +68,15 @@ let rolePermsState: RolePermissions = defaultRolePermissions();
 // Admin tick: when true, stock-out actions may take a batch below zero (default: refused).
 let allowNegativeStock = false;
 let authSecret = '';
-let agentApiKey = '';
+let agentApiKeyHash = ''; // only a hash of the AI agent key is stored; the key itself is shown once when created
+const hashKey = (k: string) => crypto.createHash('sha256').update(k).digest('hex');
+const newAgentKey = () => `wms_live_${crypto.randomBytes(20).toString('hex')}`;
+function isAgentKey(candidate: string): boolean {
+  if (!agentApiKeyHash || !candidate) return false;
+  const a = Buffer.from(hashKey(candidate));
+  const b = Buffer.from(agentApiKeyHash);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 let mssqlSimulateOffline = false;
 
 let store: Store;
@@ -191,7 +199,7 @@ function currentMeta(): Record<string, string> {
     deletedCategories: JSON.stringify(deletedCategoriesState),
     rolePermissions: JSON.stringify(rolePermsState),
     allowNegativeStock: JSON.stringify(allowNegativeStock),
-    agentApiKey: agentApiKey
+    agentApiKeyHash: agentApiKeyHash
   };
 }
 
@@ -218,12 +226,12 @@ async function reloadFromDb() {
   rolePermsState = rp ? { ...defaultRolePermissions(), ...JSON.parse(rp) } : defaultRolePermissions();
   const an = await persistence.getMeta('allowNegativeStock');
   allowNegativeStock = an ? JSON.parse(an) === true : false;
-  const ak = await persistence.getMeta('agentApiKey');
-  if (ak) agentApiKey = ak;
+  const ak = await persistence.getMeta('agentApiKeyHash');
+  if (ak) agentApiKeyHash = ak;
   if (dc) persistence.setSavedMeta('deletedCategories', dc);
   if (rp) persistence.setSavedMeta('rolePermissions', rp);
   if (an) persistence.setSavedMeta('allowNegativeStock', an);
-  if (ak) persistence.setSavedMeta('agentApiKey', ak);
+  if (ak) persistence.setSavedMeta('agentApiKeyHash', ak);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +250,11 @@ async function initialize() {
       port: cfg.port,
       database: cfg.database
     };
+    const allowMemoryFallback = process.env.WMS_ALLOW_MEMORY_FALLBACK === '1';
     if (!cfg.user || !cfg.password) {
-      sqlConnectionError = 'MSSQL_USER and MSSQL_PASSWORD are not fully configured';
-      console.warn(`[WMS] ${sqlConnectionError}. Starting with in-memory store fallback.`);
+      sqlConnectionError = 'MSSQL_USER and MSSQL_PASSWORD are not set in the .env file';
+      if (!allowMemoryFallback) throw new Error(sqlConnectionError + '.');
+      console.warn(`[WMS] ${sqlConnectionError}. WMS_ALLOW_MEMORY_FALLBACK=1: using a TEMPORARY in-memory store.`);
       store = new MemoryStore();
       await store.init();
     } else {
@@ -257,8 +267,11 @@ async function initialize() {
         console.log(`[WMS] Connected to SQL Server at ${cfg.server}:${cfg.port}`);
       } catch (err: any) {
         sqlConnectionError = err?.message || String(err);
-        console.warn(`[WMS] SQL Server connection failed (${sqlConnectionError}).`);
-        console.warn('[WMS] Falling back to in-memory store so the web service remains online and healthy.');
+        console.error(`[WMS] SQL Server connection failed: ${sqlConnectionError}`);
+        if (!allowMemoryFallback) {
+          throw new Error(`Cannot reach SQL Server (${sqlConnectionError}). The service will not start without its database, so no work is lost.`);
+        }
+        console.warn('[WMS] WMS_ALLOW_MEMORY_FALLBACK=1: using a TEMPORARY in-memory store. Everything is LOST when the service stops.');
         store = new MemoryStore();
         await store.init();
       }
@@ -275,19 +288,20 @@ async function initialize() {
     meta.authSecret = authSecret;
   }
 
-  // AI Agent API Access Key (configured in env, database, or generated)
-  if (!agentApiKey) {
-    agentApiKey = process.env.AGENT_API_KEY || (await persistence.getMeta('agentApiKey')) || '';
-  }
-  if (!agentApiKey) {
-    agentApiKey = `wms_live_${crypto.randomBytes(20).toString('hex')}`;
-    meta.agentApiKey = agentApiKey;
+  // AI Agent API key. Only its hash is kept. A key set in AGENT_API_KEY wins; otherwise one is
+  // generated on first run and printed once (an Admin can create a new one in the app at any time).
+  if (process.env.AGENT_API_KEY) {
+    agentApiKeyHash = hashKey(process.env.AGENT_API_KEY);
+  } else if (!agentApiKeyHash) {
+    const firstKey = newAgentKey();
+    agentApiKeyHash = hashKey(firstKey);
+    console.log('[WMS] AI agent API key (shown once - or create a new one in the app): ' + firstKey);
   }
 
   // First run: load starter data once.
   const seeded = await persistence.getMeta('seeded');
   if (!seeded) {
-    const mode = (process.env.SEED_MODE || (process.env.NODE_ENV === 'production' ? 'master' : 'demo')).toLowerCase(); // master | demo | none
+    const mode = (process.env.SEED_MODE || 'master').toLowerCase(); // master | demo | none
     if (mode !== 'none') {
       if (skusState.length === 0) skusState = INITIAL_SKUS.map((x) => ({ ...x }));
       if (locationsState.length === 0) locationsState = INITIAL_LOCATIONS.map((x) => ({ ...x }));
@@ -310,42 +324,30 @@ async function initialize() {
     meta.seeded = mode;
   }
 
-  // Ensure demo accounts exist in development environments so all roles can be tested
-  if (process.env.NODE_ENV !== 'production') {
-    const demoPw = process.env.DEMO_USER_PASSWORD || 'Demo12345!';
-    INITIAL_USERS.forEach((u) => {
-      const existing = usersState.find((x) => x.id === u.id || x.email.toLowerCase() === u.email.toLowerCase());
-      if (!existing) {
-        usersState.push({ ...u, passwordHash: hashPassword(demoPw) });
-      } else if (!existing.passwordHash) {
-        existing.passwordHash = hashPassword(demoPw);
-      }
-    });
-  }
-
-  // First run or dev: create the administrator account.
-  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@mayralab.local').trim();
-  const adminPw = process.env.ADMIN_PASSWORD || 'Admin12345!';
-  const existingAdmin = usersState.find((u) => u.email.toLowerCase() === adminEmail.toLowerCase() || u.id === 'USR-ADMIN');
-
-  if (!existingAdmin) {
+  // First run: create the administrator account (never with a built-in password).
+  if (!usersState.some((u) => u.role === 'Admin' && !u.disabled)) {
+    const email = (process.env.ADMIN_EMAIL || 'admin@mayralab.local').trim();
+    let pw = process.env.ADMIN_PASSWORD || '';
+    let generated = false;
+    if (!pw) {
+      pw = crypto.randomBytes(9).toString('base64url');
+      generated = true;
+    }
     usersState.push({
       id: 'USR-ADMIN',
-      name: 'System Administrator',
-      email: adminEmail,
+      name: 'Administrator',
+      email,
       role: 'Admin',
       department: 'Management',
       shift: 'Any',
       badgeCode: 'BDG-ADMIN',
-      passwordHash: hashPassword(adminPw)
+      passwordHash: hashPassword(pw)
     });
     console.log('================================================================');
-    console.log(' Administrator account ready:');
-    console.log(`   Login:    ${adminEmail}`);
-    console.log(`   Password: ${adminPw}`);
+    console.log(' First run: administrator account created');
+    console.log(`   Login:    ${email}`);
+    console.log(`   Password: ${generated ? pw + '   (generated - note it down and change it after login)' : '(from ADMIN_PASSWORD in .env)'}`);
     console.log('================================================================');
-  } else if (!process.env.ADMIN_PASSWORD && process.env.NODE_ENV !== 'production') {
-    existingAdmin.passwordHash = hashPassword('Admin12345!');
   }
 
   await persistence.commit(stateForPersistence() as any, { ...currentMeta(), ...meta });
@@ -380,8 +382,6 @@ function acquireLock(): Promise<() => void> {
 
 const PUBLIC_API = new Set([
   'GET /api/health',
-  'GET /api/mssql/ping',
-  'POST /api/mssql/toggle-simulate-offline',
   'POST /api/auth/login',
   'GET /api/agent/v1/openapi.json',
   'GET /api/agent/v1/tools'
@@ -399,7 +399,11 @@ app.use('/api', async (req, res, next) => {
     let user: StoredUser | undefined;
 
     // Check if authenticating via AI Agent API Key
-    if (agentApiKey && (apiKeyHeader === agentApiKey || token === agentApiKey)) {
+    if (isAgentKey(apiKeyHeader) || isAgentKey(token)) {
+      // The key is only good for the agent API, never for the rest of the system.
+      if (!`/api${req.path}`.startsWith('/api/agent/v1/')) {
+        return res.status(403).json({ error: 'The AI agent key can only be used on /api/agent/v1/.' });
+      }
       user = {
         id: 'USR-AI-AGENT',
         name: 'Apex AI Agent',
@@ -427,8 +431,6 @@ app.use('/api', async (req, res, next) => {
 
   if (
     full === 'GET /api/health' ||
-    full === 'GET /api/mssql/ping' ||
-    full === 'POST /api/mssql/toggle-simulate-offline' ||
     full === 'GET /api/agent/v1/openapi.json' ||
     full === 'GET /api/agent/v1/tools'
   ) return next();
@@ -670,6 +672,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'online',
     system: 'ApexWMS Service',
+    // 'memory' means a TEMPORARY store (tests, or WMS_ALLOW_MEMORY_FALLBACK=1): data is lost on restart.
+    storage: store instanceof MemoryStore ? 'memory' : 'sqlserver',
     timestamp: new Date().toISOString()
   });
 });
@@ -3440,13 +3444,14 @@ function getAgentContext(): AgentContext {
 // GET /api/agent/key - View active AI Agent API key (Admin / Warehouse Manager)
 app.get('/api/agent/key', (req, res) => {
   const me = (req as any).user as StoredUser;
-  if (me.role !== 'Admin' && me.role !== 'Warehouse Manager') {
-    return res.status(403).json({ error: 'Only Admin and Warehouse Manager can access AI Agent API credentials.' });
+  if (me.role !== 'Admin') {
+    return res.status(403).json({ error: 'Only an Admin can see the AI Agent API settings.' });
   }
   const host = req.get('host') || 'localhost:3000';
   const protocol = req.protocol || 'http';
   res.json({
-    apiKey: agentApiKey,
+    apiKey: '',
+    keyHint: 'The key is stored securely and cannot be shown again. Create a new key if you lost it.',
     baseUrl: `${protocol}://${host}/api/agent/v1`,
     toolsCount: AGENT_TOOLS.length,
     status: 'ACTIVE'
@@ -3459,9 +3464,9 @@ app.post('/api/agent/key/regenerate', async (req, res) => {
   if (me.role !== 'Admin') {
     return res.status(403).json({ error: 'Only an Admin can regenerate the AI Agent API key.' });
   }
-  const oldKey = agentApiKey;
-  agentApiKey = `wms_live_${crypto.randomBytes(20).toString('hex')}`;
-  
+  const freshKey = newAgentKey();
+  agentApiKeyHash = hashKey(freshKey);
+
   auditLogsState.unshift({
     id: `AUD-${uid()}`,
     timestamp: nowStamp(),
@@ -3479,9 +3484,9 @@ app.post('/api/agent/key/regenerate', async (req, res) => {
   const host = req.get('host') || 'localhost:3000';
   const protocol = req.protocol || 'http';
   res.json({
-    apiKey: agentApiKey,
+    apiKey: freshKey,
     baseUrl: `${protocol}://${host}/api/agent/v1`,
-    message: 'New AI Agent API Key generated successfully.'
+    message: 'New AI Agent API key created. Copy it now - it will not be shown again. The old key no longer works.'
   });
 });
 

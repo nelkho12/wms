@@ -44,14 +44,17 @@ export interface BatchTraceabilityProps {
 
 export const getDaysToExpiry = (bestBeforeDate: string): number => {
   if (!bestBeforeDate) return 999;
-  const now = new Date();
-  const bbd = new Date(bestBeforeDate);
-  return Math.ceil((bbd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+  // Whole calendar days (today = 0), same rule as the service.
+  const [y, m, d] = bestBeforeDate.slice(0, 10).split('-').map(Number);
+  if (!y || !m || !d) return 999;
+  const t = new Date();
+  const today = Date.UTC(t.getFullYear(), t.getMonth(), t.getDate());
+  return Math.round((Date.UTC(y, m - 1, d) - today) / 86400000);
 };
 
 export const getExpiryStatusInfo = (bestBeforeDate: string, status?: string) => {
   const days = getDaysToExpiry(bestBeforeDate);
-  const isExpired = status === 'EXPIRED' || days <= 0;
+  const isExpired = status === 'EXPIRED' || days < 0;
 
   if (isExpired) {
     const daysAgo = Math.abs(days);
@@ -69,7 +72,7 @@ export const getExpiryStatusInfo = (bestBeforeDate: string, status?: string) => 
   if (days <= 30) {
     return {
       category: 'NEXT_30_DAYS' as const,
-      label: `${days}d left (Urgent FEFO)`,
+      label: days === 0 ? 'Expires today (Urgent FEFO)' : `${days}d left (Urgent FEFO)`,
       badgeClass: 'bg-orange-100 text-orange-800 border-orange-300',
       pillClass: 'bg-orange-50 text-orange-700 border-orange-300',
       icon: AlertTriangle,
@@ -156,7 +159,7 @@ export const BatchTraceability: React.FC<BatchTraceabilityProps> = ({
 
     batches.forEach((b) => {
       const days = getDaysToExpiry(b.bestBeforeDate);
-      const isExpired = b.status === 'EXPIRED' || days <= 0;
+      const isExpired = b.status === 'EXPIRED' || days < 0;
       const val = Math.max(0, b.quantityOnHand) * (b.unitCost || 0);
 
       if (isExpired) {
@@ -196,7 +199,7 @@ export const BatchTraceability: React.FC<BatchTraceabilityProps> = ({
       // Expiry range filter
       if (expiryFilter !== 'ALL') {
         const days = getDaysToExpiry(b.bestBeforeDate);
-        const isExpired = b.status === 'EXPIRED' || days <= 0;
+        const isExpired = b.status === 'EXPIRED' || days < 0;
 
         if (expiryFilter === 'PAST_DUE' && !isExpired) return false;
         if (expiryFilter === 'NEXT_30_DAYS' && (isExpired || days < 1 || days > 30)) return false;
@@ -288,7 +291,7 @@ export const BatchTraceability: React.FC<BatchTraceabilityProps> = ({
     const headers = ['Batch No', 'SKU', 'Item Name', 'BBD (Expiry)', 'Days Remaining', 'Status', 'Location Bin', 'On-Hand Qty', 'Unit Cost', 'Inventory Value', 'Supplier'];
     const rows = filteredBatches.map((b) => {
       const days = getDaysToExpiry(b.bestBeforeDate);
-      const val = (b.quantityOnHand * (b.unitCost || 0)).toFixed(2);
+      const val = (Math.max(0, b.quantityOnHand) * (b.unitCost || 0)).toFixed(2);
       return [
         `"${b.batchNo}"`,
         `"${b.sku}"`,
@@ -425,7 +428,7 @@ export const BatchTraceability: React.FC<BatchTraceabilityProps> = ({
           >
             {batches.map((b) => {
               const days = getDaysToExpiry(b.bestBeforeDate);
-              const tag = days <= 0 ? ' [EXPIRED]' : days <= 30 ? ` [${days}d left]` : '';
+              const tag = days < 0 ? ' [EXPIRED]' : days <= 30 ? ` [${days}d left]` : '';
               return (
                 <option key={b.id} value={b.batchNo} className="bg-white text-slate-900">
                   {b.batchNo} - {b.itemName.slice(0, 22)}{tag}
@@ -703,7 +706,7 @@ export const BatchTraceability: React.FC<BatchTraceabilityProps> = ({
                   const isSelected = activeBatch?.batchNo === b.batchNo;
                   const expiryInfo = getExpiryStatusInfo(b.bestBeforeDate, b.status);
                   const Icon = expiryInfo.icon;
-                  const lotValue = (b.quantityOnHand * (b.unitCost || 0)).toFixed(2);
+                  const lotValue = (Math.max(0, b.quantityOnHand) * (b.unitCost || 0)).toFixed(2);
 
                   return (
                     <tr
@@ -898,7 +901,7 @@ export const BatchTraceability: React.FC<BatchTraceabilityProps> = ({
                 <div className="flex justify-between">
                   <span className="text-slate-500">Lot Inventory Value:</span>
                   <span className="text-slate-900 font-bold">
-                    ${(activeBatch.quantityOnHand * (activeBatch.unitCost || 0)).toFixed(2)}
+                    ${(Math.max(0, activeBatch.quantityOnHand) * (activeBatch.unitCost || 0)).toFixed(2)}
                   </span>
                 </div>
               </div>

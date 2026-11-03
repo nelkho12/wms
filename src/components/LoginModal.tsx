@@ -167,24 +167,14 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onLogin, prefill
             <span>{isLoading ? 'Signing in...' : 'Sign In'}</span>
           </button>
 
-          {/* Quick-fill Demo & Admin Credentials */}
+          {/* Demo quick-fill: only in development builds (npm run dev), never in the installed app */}
+          {(import.meta as any).env?.DEV && (
           <div className="pt-2 border-t border-slate-100">
             <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center justify-between">
               <span>Quick Login Accounts</span>
               <span className="text-[10px] text-indigo-600 font-bold lowercase">Click to pre-fill</span>
             </p>
             <div className="grid grid-cols-2 gap-1.5">
-              <button
-                type="button"
-                onClick={() => {
-                  setEmail('admin@mayralab.local');
-                  setPassword('Admin12345!');
-                }}
-                className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 border border-rose-200/70 rounded-lg text-left transition-colors cursor-pointer"
-              >
-                <div className="text-[11px] font-bold text-rose-900 truncate">System Admin</div>
-                <div className="text-[9px] text-rose-700/80 font-mono">admin@mayralab.local</div>
-              </button>
 
               <button
                 type="button"
@@ -237,6 +227,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onLogin, prefill
               </button>
             </div>
           </div>
+          )}
 
           {!askAddress && !showServer && (
             <button

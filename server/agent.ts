@@ -33,6 +33,21 @@ export interface AgentToolDeclaration {
   };
 }
 
+const isDateStr = (d: unknown): d is string =>
+  typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && !isNaN(new Date(d).getTime());
+
+/** Batch numbers are only unique per product, so the product is used whenever it is given. */
+function findBatch(batches: Batch[], batchNo: string, sku?: unknown): { batch?: Batch; error?: string } {
+  const wanted = batchNo.toLowerCase();
+  const wantedSku = sku ? String(sku).toLowerCase() : '';
+  const matches = batches.filter((b) => b.batchNo.toLowerCase() === wanted && (!wantedSku || b.sku.toLowerCase() === wantedSku));
+  if (matches.length === 0) return { error: `Batch '${batchNo}'${wantedSku ? ` for SKU '${sku}'` : ''} not found` };
+  if (matches.length > 1) {
+    return { error: `Batch number '${batchNo}' exists for more than one product (${matches.map((b) => b.sku).join(', ')}). Include "sku".` };
+  }
+  return { batch: matches[0] };
+}
+
 export const AGENT_TOOLS: AgentToolDeclaration[] = [
   {
     name: 'get_warehouse_status',
@@ -91,6 +106,7 @@ export const AGENT_TOOLS: AgentToolDeclaration[] = [
       type: 'object',
       properties: {
         batchNo: { type: 'string', description: 'The batch number to quarantine or release' },
+        sku: { type: 'string', description: 'Product SKU (needed when the batch number exists for more than one product)' },
         quarantined: { type: 'boolean', description: 'True to quarantine, False to release to ACTIVE' },
         reason: { type: 'string', description: 'Reason for quarantine action or inspection result' }
       },
@@ -159,6 +175,7 @@ export const AGENT_TOOLS: AgentToolDeclaration[] = [
       type: 'object',
       properties: {
         batchNo: { type: 'string', description: 'Batch number to adjust' },
+        sku: { type: 'string', description: 'Product SKU (needed when the batch number exists for more than one product)' },
         newQuantity: { type: 'number', description: 'New verified quantity on hand' },
         reason: { type: 'string', description: 'Audit reason for the adjustment (e.g. Physical cycle count variance, damaged carton)' },
         operator: { type: 'string', description: 'Name or ID of agent/operator performing adjustment' }
@@ -173,8 +190,9 @@ export const AGENT_TOOLS: AgentToolDeclaration[] = [
       type: 'object',
       properties: {
         batchNo: { type: 'string', description: 'Batch number to relocate' },
+        sku: { type: 'string', description: 'Product SKU (needed when the batch number exists for more than one product)' },
         toLocationId: { type: 'string', description: 'Target destination location ID (e.g. B-02-03)' },
-        quantity: { type: 'number', description: 'Quantity to transfer (if omitted, transfers entire batch)' },
+        quantity: { type: 'number', description: 'Optional. Whole batches only: if given it must equal the batch quantity on hand' },
         operator: { type: 'string', description: 'Operator or AI Agent executing the transfer' }
       },
       required: ['batchNo', 'toLocationId']
@@ -193,7 +211,7 @@ export const AGENT_TOOLS: AgentToolDeclaration[] = [
   },
   {
     name: 'execute_sql_query',
-    description: 'Execute a read-only SQL query against the warehouse MS SQL Server schema (dbo.Inventory, dbo.Batches, dbo.Locations, dbo.PickOrders, dbo.StockMovements).',
+    description: 'Read-only table listing. NOT a real SQL engine: the query text is only used to pick one of Skus, Batches, Locations, SalesOrders or StockMovements, and the first 50 rows are returned (WHERE / JOIN are ignored). Prefer the specific tools such as search_inventory.',
     parameters: {
       type: 'object',
       properties: {
@@ -398,12 +416,16 @@ export async function executeAgentTool(
       const quarantined = Boolean(params.quarantined);
       const reason = String(params.reason || (quarantined ? 'Quarantined via AI Agent API' : 'Released via AI Agent API'));
 
-      const batch = batches.find((b) => b.batchNo.toLowerCase() === batchNo.toLowerCase());
-      if (!batch) return { success: false, error: `Batch '${batchNo}' not found` };
+      const found = findBatch(batches, batchNo, params.sku);
+      if (!found.batch) return { success: false, error: found.error };
+      const batch = found.batch;
+      if (batch.status === 'RECALLED' || batch.status === 'EXPIRED') {
+        return { success: false, error: `Batch ${batch.batchNo} is ${batch.status} and cannot be held or released here.` };
+      }
 
       const oldStatus = batch.status;
       batch.status = quarantined ? 'QUARANTINED' : 'ACTIVE';
-      batch.notes = quarantined ? reason : undefined;
+      if (params.reason) batch.notes = `${quarantined ? 'Quarantine Notice' : 'Release Note'}: ${reason}`;
 
       auditLogs.unshift({
         id: `AUD-${uid()}`,
@@ -522,32 +544,50 @@ export async function executeAgentTool(
 
     case 'receive_stock': {
       const { sku: skuCode, batchNo, quantity, locationId, bestBeforeDate, manufactureDate, supplier, unitCost } = params;
-      if (!skuCode || !batchNo || !quantity || !locationId || !bestBeforeDate) {
+      if (!skuCode || !batchNo || quantity === undefined || !locationId || !bestBeforeDate) {
         return { success: false, error: 'Missing required parameters: sku, batchNo, quantity, locationId, bestBeforeDate' };
       }
       const qtyNum = Number(quantity);
-      if (isNaN(qtyNum) || qtyNum <= 0) return { success: false, error: 'Quantity must be a positive number' };
+      if (!Number.isFinite(qtyNum) || qtyNum <= 0) return { success: false, error: 'Quantity must be a number greater than 0' };
+      if (!isDateStr(bestBeforeDate)) return { success: false, error: 'bestBeforeDate must be a real date written YYYY-MM-DD' };
+      if (manufactureDate !== undefined && manufactureDate !== '' && !isDateStr(manufactureDate)) {
+        return { success: false, error: 'manufactureDate must be a real date written YYYY-MM-DD' };
+      }
+      if (unitCost !== undefined && (!Number.isFinite(Number(unitCost)) || Number(unitCost) < 0)) {
+        return { success: false, error: 'unitCost must be a number, 0 or more' };
+      }
 
       const existingSku = skus.find((s) => s.sku.toLowerCase() === String(skuCode).toLowerCase());
-      const itemName = existingSku ? existingSku.name : `Product ${skuCode}`;
+      if (!existingSku) return { success: false, error: `SKU '${skuCode}' is not in the product list. Add it in the app first.` };
+      const loc = locations.find((l) => l.id.toLowerCase() === String(locationId).toLowerCase());
+      if (!loc) return { success: false, error: `Location '${locationId}' not found in the warehouse` };
+      const itemName = existingSku.name;
 
-      let batch = batches.find((b) => b.batchNo.toLowerCase() === String(batchNo).toLowerCase());
+      let batch = batches.find(
+        (b) => b.batchNo.toLowerCase() === String(batchNo).toLowerCase() && b.sku.toLowerCase() === existingSku.sku.toLowerCase()
+      );
       if (batch) {
+        if (batch.locationId !== loc.id) {
+          return { success: false, error: `Batch ${batch.batchNo} is already stored in ${batch.locationId}. Receive into that location, or move the batch first.` };
+        }
+        if (batch.status !== 'ACTIVE') {
+          return { success: false, error: `Batch ${batch.batchNo} is ${batch.status}; it cannot receive more stock.` };
+        }
         batch.quantityOnHand += qtyNum;
-        batch.locationId = locationId;
+        batch.quantityAvailable = Math.max(0, batch.quantityOnHand - (batch.quantityAllocated || 0));
       } else {
         batch = {
           id: `BAT-${uid()}`,
           batchNo: String(batchNo),
-          sku: String(skuCode),
+          sku: existingSku.sku,
           itemName,
           quantityOnHand: qtyNum,
           quantityAllocated: 0,
           quantityAvailable: qtyNum,
-          unitCost: unitCost !== undefined ? Number(unitCost) : (existingSku?.unitCost ?? 0),
+          unitCost: unitCost !== undefined ? Number(unitCost) : (existingSku.unitCost ?? 0),
           bestBeforeDate: String(bestBeforeDate),
           manufactureDate: manufactureDate ? String(manufactureDate) : nowStamp().slice(0, 10),
-          locationId: String(locationId),
+          locationId: loc.id,
           status: 'ACTIVE',
           receivedAt: nowStamp(),
           supplier: supplier ? String(supplier) : 'External AI Agent Supplier'
@@ -559,11 +599,11 @@ export async function executeAgentTool(
         id: `LOG-${uid()}`,
         timestamp: nowStamp(),
         type: 'INBOUND_RECEIVE',
-        sku: String(skuCode),
+        sku: existingSku.sku,
         itemName,
         batchNo: String(batchNo),
         fromLocation: 'Receiving Dock',
-        toLocation: String(locationId),
+        toLocation: loc.id,
         quantity: qtyNum,
         operator: 'Apex AI Agent',
         referenceDoc: 'AI_AGENT_INBOUND'
@@ -605,8 +645,9 @@ export async function executeAgentTool(
         return { success: false, error: 'batchNo and non-negative newQuantity are required' };
       }
 
-      const batch = batches.find((b) => b.batchNo.toLowerCase() === batchNo.toLowerCase());
-      if (!batch) return { success: false, error: `Batch '${batchNo}' not found` };
+      const found = findBatch(batches, batchNo, params.sku);
+      if (!found.batch) return { success: false, error: found.error };
+      const batch = found.batch;
 
       const oldQty = batch.quantityOnHand;
       const diff = newQty - oldQty;
@@ -660,13 +701,18 @@ export async function executeAgentTool(
 
       if (!batchNo || !toLocId) return { success: false, error: 'batchNo and toLocationId are required' };
 
-      const batch = batches.find((b) => b.batchNo.toLowerCase() === batchNo.toLowerCase());
-      if (!batch) return { success: false, error: `Batch '${batchNo}' not found` };
+      const found = findBatch(batches, batchNo, params.sku);
+      if (!found.batch) return { success: false, error: found.error };
+      const batch = found.batch;
+      if (params.quantity !== undefined && Number(params.quantity) !== batch.quantityOnHand) {
+        return { success: false, error: `Only whole batches can be moved. Omit "quantity" or use ${batch.quantityOnHand} (the full quantity on hand).` };
+      }
 
       const destLoc = locations.find((l) => l.id.toLowerCase() === toLocId.toLowerCase());
       if (!destLoc) return { success: false, error: `Destination location '${toLocId}' not found in warehouse` };
 
       const fromLocId = batch.locationId;
+      if (fromLocId === destLoc.id) return { success: false, error: `Batch ${batch.batchNo} is already in ${destLoc.id}` };
       batch.locationId = destLoc.id;
 
       stockMovements.unshift({
@@ -767,64 +813,17 @@ export async function executeAgentTool(
 
     case 'execute_sql_query': {
       const q = String(params.query || '').trim();
-      if (!/^SELECT\b/i.test(q)) {
-        return { success: false, error: 'Only read-only SELECT queries are permitted for AI agents' };
+      if (!/^SELECT\b/i.test(q) || /[;]|\b(INSERT|UPDATE|DELETE|DROP|ALTER|EXEC|MERGE|TRUNCATE|CREATE)\b/i.test(q)) {
+        return { success: false, error: 'Only a single read-only SELECT is accepted' };
       }
-
-      // Check common tables
-      if (/FROM\s+dbo\.Inventory|FROM\s+Skus/i.test(q)) {
-        return {
-          success: true,
-          data: {
-            rowCount: skus.length,
-            rows: skus.slice(0, 50)
-          }
-        };
-      }
-      if (/FROM\s+dbo\.Batches|FROM\s+Batches/i.test(q)) {
-        return {
-          success: true,
-          data: {
-            rowCount: batches.length,
-            rows: batches.slice(0, 50)
-          }
-        };
-      }
-      if (/FROM\s+dbo\.Locations|FROM\s+Locations/i.test(q)) {
-        return {
-          success: true,
-          data: {
-            rowCount: locations.length,
-            rows: locations.slice(0, 50)
-          }
-        };
-      }
-      if (/FROM\s+dbo\.PickOrders|FROM\s+SalesOrders/i.test(q)) {
-        return {
-          success: true,
-          data: {
-            rowCount: orders.length,
-            rows: orders.slice(0, 50)
-          }
-        };
-      }
-      if (/FROM\s+dbo\.StockMovements|FROM\s+StockMovements/i.test(q)) {
-        return {
-          success: true,
-          data: {
-            rowCount: stockMovements.length,
-            rows: stockMovements.slice(0, 50)
-          }
-        };
-      }
-
-      return {
-        success: true,
-        data: {
-          rowCount: 1,
-          rows: [{ QueryStatus: 'EXECUTED', Query: q, Engine: 'ApexWMS SQL Server Query Engine' }]
-        }
-      };
+      const note = 'Simulated listing: the query was NOT run. Only the table name was used and WHERE / JOIN / column lists were ignored. First 50 rows shown.';
+      const listing = (rows: any[]) => ({ success: true, data: { simulated: true, note, rowCount: rows.length, rows: rows.slice(0, 50) } });
+      if (/\bFROM\s+(dbo\.)?(Inventory|Skus)\b/i.test(q)) return listing(skus);
+      if (/\bFROM\s+(dbo\.)?Batches\b/i.test(q)) return listing(batches);
+      if (/\bFROM\s+(dbo\.)?Locations\b/i.test(q)) return listing(locations);
+      if (/\bFROM\s+(dbo\.)?(PickOrders|SalesOrders)\b/i.test(q)) return listing(orders);
+      if (/\bFROM\s+(dbo\.)?StockMovements\b/i.test(q)) return listing(stockMovements);
+      return { success: false, error: 'Unknown table. Available: Skus, Batches, Locations, SalesOrders, StockMovements.' };
     }
 
     default:
